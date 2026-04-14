@@ -105,3 +105,96 @@ router.post("/moderation/:id/edit", requireAuth, requireRole("owner", "moderator
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) => {
+  try {
+    const body = req.body;
+
+    // Log the raw payload so we can inspect it in Railway logs
+    console.log("[seed] payload keys:", Object.keys(body));
+    const questions = Array.isArray(body) ? body : (body.questions ?? body.cards ?? []);
+    console.log(`[seed] question count: ${questions.length}`);
+    if (questions.length > 0) {
+      console.log("[seed] first question sample:", JSON.stringify(questions[0]));
+    }
+
+    if (questions.length === 0) {
+      return res.status(400).json({ error: "No questions found in payload" });
+    }
+
+    let inserted = 0;
+    let failed = 0;
+    const errors = [];
+
+    for (const q of questions) {
+      try {
+        // Accept both snake_case and camelCase field names from the iOS app
+        const stableId = q.stable_id ?? q.stableId;
+        const contentPackId = q.content_pack_id ?? q.contentPackId ?? null;
+        const promptText = q.prompt_text ?? q.promptText;
+        const answerText = q.answer_text ?? q.answerText ?? null;
+        const truthStatementText = q.truth_statement_text ?? q.truthStatementText ?? null;
+        const sourceOrigin = q.source_origin ?? q.sourceOrigin ?? null;
+        const createdAt = q.created_at ?? q.createdAt ?? new Date().toISOString();
+        const updatedAt = q.updated_at ?? q.updatedAt ?? new Date().toISOString();
+
+        // Validate cloze_variants_json — set to null rather than crashing on bad data
+        let clozeJson = q.cloze_variants_json ?? q.clozeVariantsJson ?? null;
+        if (clozeJson !== null) {
+          try {
+            if (typeof clozeJson !== "string") {
+              clozeJson = JSON.stringify(clozeJson);
+            }
+            JSON.parse(clozeJson);
+          } catch {
+            console.warn(`[seed] invalid cloze_variants_json for stable_id=${stableId}, setting to null`);
+            errors.push({ stable_id: stableId, warning: "cloze_variants_json was invalid JSON and was set to null" });
+            clozeJson = null;
+          }
+        }
+
+        await query(
+          `insert into study_question
+             (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
+              truth_statement_text, cloze_variants_json, source_origin, status, created_at, updated_at)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+           on conflict (stable_id) do update set
+             topic                = excluded.topic,
+             tags                 = excluded.tags,
+             prompt_text          = excluded.prompt_text,
+             answer_text          = excluded.answer_text,
+             truth_statement_text = excluded.truth_statement_text,
+             cloze_variants_json  = excluded.cloze_variants_json,
+             source_origin        = excluded.source_origin,
+             updated_at           = excluded.updated_at`,
+          [
+            q.id,
+            stableId,
+            contentPackId,
+            q.topic ?? null,
+            q.tags ?? null,
+            promptText,
+            answerText,
+            truthStatementText,
+            clozeJson,
+            sourceOrigin,
+            q.status ?? "published",
+            createdAt,
+            updatedAt,
+          ]
+        );
+        inserted++;
+      } catch (err) {
+        console.error(`[seed] failed for stable_id=${q.stable_id ?? q.stableId}:`, err.message);
+        failed++;
+        errors.push({ stable_id: q.stable_id ?? q.stableId, error: err.message });
+      }
+    }
+
+    console.log(`[seed] complete — inserted: ${inserted}, failed: ${failed}`);
+    res.json({ inserted, failed, errors });
+  } catch (err) {
+    console.error("[seed] top-level error:", err);
+    res.status(500).json({ error: "Seed failed", detail: err.message });
+  }
+});
