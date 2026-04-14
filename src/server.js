@@ -3,6 +3,11 @@ import cors from "cors";
 import { config } from "./config.js";
 import { router } from "./routes.js";
 
+// Prevent any unhandled Promise rejection from crashing the process
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+
 const app = express();
 
 app.use(cors());
@@ -15,8 +20,7 @@ app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
-// Global error handler — catches anything that escapes route-level try/catch
-// and prevents unhandled rejections from crashing Node.js
+// Global Express error handler
 app.use((err, req, res, next) => {
   console.error(`[unhandled error] ${req.method} ${req.path}`, err);
   if (!res.headersSent) {
