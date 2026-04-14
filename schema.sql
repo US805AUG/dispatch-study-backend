@@ -18,6 +18,7 @@ create table if not exists study_question (
   answer_text text,
   truth_statement_text text,
   cloze_variants_json jsonb,
+  source_origin text,
   status text not null default 'published',
   author_id uuid references app_user(id),
   contributor_id uuid references app_user(id),
