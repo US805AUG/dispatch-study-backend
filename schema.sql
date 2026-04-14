@@ -48,3 +48,7 @@ create table if not exists moderation_event (
 
 create index if not exists idx_submission_status on study_submission(status);
 create index if not exists idx_question_status on study_question(status);
+create index if not exists idx_question_updated on study_question(updated_at);
+
+-- Migration: run once in Railway SQL editor if the table already exists
+-- alter table study_question add column if not exists source_origin text default '';

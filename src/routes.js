@@ -9,6 +9,82 @@ router.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+// App version gating — bump minRequiredVersion to force updates
+router.get("/config", (req, res) => {
+  res.json({
+    minRequiredVersion: "1.0.0",
+    latestVersion: "1.0.0",
+  });
+});
+
+// Fetch published questions for daily user sync
+router.get("/questions", async (req, res) => {
+  const { since } = req.query;
+  const params = [];
+  let sql = "select * from study_question where status = 'published'";
+  if (since) {
+    params.push(new Date(since));
+    sql += ` and updated_at > $${params.length}`;
+  }
+  sql += " order by updated_at desc limit 2000";
+  const { rows } = await query(sql, params);
+  // Re-serialize cloze_variants_json (JSONB → string) so Swift gets a consistent type
+  const questions = rows.map((r) => ({
+    ...r,
+    cloze_variants_json: r.cloze_variants_json
+      ? JSON.stringify(r.cloze_variants_json)
+      : null,
+  }));
+  res.json({ questions, synced_at: new Date().toISOString() });
+});
+
+// Owner-only bulk upsert — seeds the question bank from the owner's iPhone
+router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) => {
+  const { questions } = req.body;
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return res.status(400).json({ error: "questions array required" });
+  }
+  let upserted = 0;
+  for (const q of questions) {
+    let clozeJson = null;
+    if (q.clozeVariantsJson) {
+      try { clozeJson = JSON.parse(q.clozeVariantsJson); } catch { /* ignore */ }
+    }
+    await query(
+      `insert into study_question
+         (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
+          truth_statement_text, cloze_variants_json, source_origin, status, created_at, updated_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       on conflict (stable_id) do update set
+         topic               = excluded.topic,
+         tags                = excluded.tags,
+         prompt_text         = excluded.prompt_text,
+         answer_text         = excluded.answer_text,
+         truth_statement_text = excluded.truth_statement_text,
+         cloze_variants_json = excluded.cloze_variants_json,
+         source_origin       = excluded.source_origin,
+         updated_at          = excluded.updated_at`,
+      [
+        crypto.randomUUID(),
+        q.stableId,
+        q.contentPackId ?? null,
+        q.topic ?? "",
+        q.tags ?? [],
+        q.promptText,
+        q.answerText ?? "",
+        q.truthStatementText ?? "",
+        clozeJson,
+        q.sourceOrigin ?? "",
+        q.status ?? "published",
+        q.createdAt ? new Date(q.createdAt) : new Date(),
+        q.updatedAt ? new Date(q.updatedAt) : new Date(),
+      ]
+    );
+    upserted++;
+  }
+  res.json({ upserted });
+});
+
 router.post("/auth/apple", async (req, res) => {
   try {
     const { identityToken } = req.body;
