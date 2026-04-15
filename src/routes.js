@@ -278,3 +278,37 @@ router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) =
     res.status(500).json({ error: "Seed failed", detail: err.message });
   }
 });
+
+// MARK: - User Management (owner only)
+
+router.get("/admin/users", requireAuth, requireRole("owner"), async (req, res) => {
+  try {
+    const { rows } = await query(
+      "select id, email, display_name, role, created_at from app_user order by created_at asc"
+    );
+    res.json({ users: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.patch("/admin/users/:id/role", requireAuth, requireRole("owner"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+    const validRoles = ["user", "moderator", "owner"];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${validRoles.join(", ")}` });
+    }
+    const { rowCount } = await query(
+      "update app_user set role = $1, updated_at = now() where id = $2",
+      [role, id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
