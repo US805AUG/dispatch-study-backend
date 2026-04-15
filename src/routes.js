@@ -39,50 +39,52 @@ router.get("/questions", async (req, res) => {
 });
 
 // Owner-only bulk upsert — seeds the question bank from the owner's iPhone
+// Note: cloze_variants_json is intentionally NOT seeded — variants are generated
+// per-device by ClozeGenerationEngine and don't need to live on the server.
 router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) => {
   const { questions } = req.body;
   if (!Array.isArray(questions) || questions.length === 0) {
     return res.status(400).json({ error: "questions array required" });
   }
   let upserted = 0;
+  let failed = 0;
   for (const q of questions) {
-    let clozeJson = null;
-    if (q.clozeVariantsJson) {
-      try { clozeJson = JSON.parse(q.clozeVariantsJson); } catch { /* ignore */ }
+    try {
+      await query(
+        `insert into study_question
+           (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
+            truth_statement_text, source_origin, status, created_at, updated_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         on conflict (stable_id) do update set
+           topic               = excluded.topic,
+           tags                = excluded.tags,
+           prompt_text         = excluded.prompt_text,
+           answer_text         = excluded.answer_text,
+           truth_statement_text = excluded.truth_statement_text,
+           source_origin       = excluded.source_origin,
+           updated_at          = excluded.updated_at`,
+        [
+          crypto.randomUUID(),
+          q.stableId,
+          q.contentPackId ?? null,
+          q.topic ?? "",
+          q.tags ?? [],
+          q.promptText,
+          q.answerText ?? "",
+          q.truthStatementText ?? "",
+          q.sourceOrigin ?? "",
+          q.status ?? "published",
+          q.createdAt ? new Date(q.createdAt) : new Date(),
+          q.updatedAt ? new Date(q.updatedAt) : new Date(),
+        ]
+      );
+      upserted++;
+    } catch (err) {
+      console.error(`[seed] failed on stableId=${q.stableId}:`, err.message);
+      failed++;
     }
-    await query(
-      `insert into study_question
-         (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
-          truth_statement_text, cloze_variants_json, source_origin, status, created_at, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-       on conflict (stable_id) do update set
-         topic               = excluded.topic,
-         tags                = excluded.tags,
-         prompt_text         = excluded.prompt_text,
-         answer_text         = excluded.answer_text,
-         truth_statement_text = excluded.truth_statement_text,
-         cloze_variants_json = excluded.cloze_variants_json,
-         source_origin       = excluded.source_origin,
-         updated_at          = excluded.updated_at`,
-      [
-        crypto.randomUUID(),
-        q.stableId,
-        q.contentPackId ?? null,
-        q.topic ?? "",
-        q.tags ?? [],
-        q.promptText,
-        q.answerText ?? "",
-        q.truthStatementText ?? "",
-        clozeJson,
-        q.sourceOrigin ?? "",
-        q.status ?? "published",
-        q.createdAt ? new Date(q.createdAt) : new Date(),
-        q.updatedAt ? new Date(q.updatedAt) : new Date(),
-      ]
-    );
-    upserted++;
   }
-  res.json({ upserted });
+  res.json({ upserted, failed });
 });
 
 router.post("/auth/apple", async (req, res) => {

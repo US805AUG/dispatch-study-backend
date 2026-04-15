@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import { config } from "./config.js";
 import { router } from "./routes.js";
+import { query } from "./db.js";
 
 // Prevent any unhandled Promise rejection from crashing the process
 process.on("unhandledRejection", (reason) => {
@@ -28,6 +29,13 @@ app.use((err, req, res, next) => {
   }
 });
 
-app.listen(config.port, () => {
+// Run idempotent migrations on startup
+async function runMigrations() {
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS source_origin text DEFAULT ''");
+  console.log("Migrations complete.");
+}
+
+app.listen(config.port, async () => {
   console.log(`Backend listening on ${config.port}`);
+  await runMigrations().catch((e) => console.error("Migration error:", e.message));
 });
