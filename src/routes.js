@@ -10,10 +10,12 @@ router.get("/health", (req, res) => {
 });
 
 // App version gating — bump minRequiredVersion to force updates
+// Set APP_STORE_URL env var once the app is live on the App Store
 router.get("/config", (req, res) => {
   res.json({
-    minRequiredVersion: "1.0.0",
-    latestVersion: "1.0.0",
+    minRequiredVersion: process.env.MIN_REQUIRED_VERSION ?? "1.0.0",
+    latestVersion: process.env.LATEST_VERSION ?? "1.0.0",
+    appStoreUrl: process.env.APP_STORE_URL ?? "",
   });
 });
 
