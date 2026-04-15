@@ -33,6 +33,7 @@ create table if not exists study_submission (
   submitter_alias text,
   reason text,
   note text,
+  proposed_cloze_variants_json jsonb,
   status text not null default 'pending',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()

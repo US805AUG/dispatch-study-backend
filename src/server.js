@@ -32,6 +32,7 @@ app.use((err, req, res, next) => {
 // Run idempotent migrations on startup
 async function runMigrations() {
   await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS source_origin text DEFAULT ''");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS proposed_cloze_variants_json jsonb");
   console.log("Migrations complete.");
 }
 
