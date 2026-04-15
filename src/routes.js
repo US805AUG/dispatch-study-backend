@@ -115,6 +115,54 @@ router.get("/packs/:packId/cards", requireAuth, async (req, res) => {
   }
 });
 
+// User submits a brand-new personal card for owner review.
+// Inserts a pending (non-published) question + a submission row for the moderation queue.
+router.post("/submissions/new-card", requireAuth, async (req, res) => {
+  try {
+    const { stableId, promptText, answerText, truthStatementText, topic, tags, submitterAlias } = req.body;
+    if (!truthStatementText && !promptText) {
+      return res.status(400).json({ error: "truthStatementText or promptText required" });
+    }
+
+    // Insert as a pending question (status = 'pending' so it never appears in the daily sync)
+    const questionId = crypto.randomUUID();
+    const usedStableId = stableId ?? crypto.randomUUID();
+    await query(
+      `insert into study_question
+         (id, stable_id, topic, tags, prompt_text, answer_text,
+          truth_statement_text, source_origin, status, created_at, updated_at)
+       values ($1,$2,$3,$4,$5,$6,$7,'user-submission','pending',now(),now())
+       on conflict (stable_id) do update set
+         topic               = excluded.topic,
+         prompt_text         = excluded.prompt_text,
+         answer_text         = excluded.answer_text,
+         truth_statement_text = excluded.truth_statement_text,
+         updated_at          = now()`,
+      [questionId, usedStableId, topic ?? "", tags ?? [], promptText ?? "", answerText ?? "", truthStatementText ?? ""]
+    );
+
+    // Create the submission row so it appears in the moderation queue
+    const submissionId = crypto.randomUUID();
+    await query(
+      `insert into study_submission
+         (id, question_id, submitter_id, submitter_alias, reason, note, status)
+       values ($1,$2,$3,$4,'new-card',$5,'pending')`,
+      [
+        submissionId,
+        questionId,
+        req.user.sub,
+        submitterAlias ?? "anonymous",
+        `New card: ${(truthStatementText ?? promptText ?? "").substring(0, 120)}`
+      ]
+    );
+
+    res.json({ id: submissionId });
+  } catch (err) {
+    console.error("[new-card]", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 router.post("/submissions", requireAuth, async (req, res) => {
   try {
     const { questionId, reason, note } = req.body;
