@@ -8,6 +8,7 @@ import {
   requireRole,
 } from "./auth.js";
 import { query } from "./db.js";
+import { deploymentInfo } from "./deploymentInfo.js";
 
 export const router = express.Router();
 
@@ -219,6 +220,10 @@ router.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+router.get("/health/version", (req, res) => {
+  res.json(deploymentInfo);
+});
+
 router.get("/config", (req, res) => {
   res.json({
     minRequiredVersion: process.env.MIN_REQUIRED_VERSION ?? "1.0.0",
@@ -390,7 +395,21 @@ router.post("/admin/questions/delete", requireAuth, requireRole("owner"), async 
   }
 });
 
-router.post("/submissions/new-card", requireAuth, async (req, res) => {
+function logNewCardRouteEntry(req, res, next) {
+  console.log("[new-card] route entry", {
+    commitSha: deploymentInfo.commitSha,
+    deploymentTimestamp: deploymentInfo.deploymentTimestamp,
+    environment: deploymentInfo.environment,
+    contentType: req.headers["content-type"] ?? null,
+    contentLength: req.headers["content-length"] ?? null,
+    hasAuthorization: isNonEmptyString(req.headers.authorization),
+    bodyType: req.body == null ? "null" : typeof req.body,
+    bodyKeys: req.body && typeof req.body === "object" ? Object.keys(req.body) : [],
+  });
+  next();
+}
+
+router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (req, res) => {
   try {
     const {
       stableId,

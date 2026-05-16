@@ -3,6 +3,7 @@ import cors from "cors";
 import { config } from "./config.js";
 import { router } from "./routes.js";
 import { query } from "./db.js";
+import { deploymentInfo } from "./deploymentInfo.js";
 
 // Prevent any unhandled Promise rejection from crashing the process
 process.on("unhandledRejection", (reason) => {
@@ -51,5 +52,6 @@ async function runMigrations() {
 
 app.listen(config.port, async () => {
   console.log(`Backend listening on ${config.port}`);
+  console.log("[deployment]", deploymentInfo);
   await runMigrations().catch((e) => console.error("Migration error:", e.message));
 });
