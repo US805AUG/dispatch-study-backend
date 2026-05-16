@@ -254,7 +254,6 @@ router.get("/questions", async (req, res) => {
       where status = 'published'
         and truth_statement_text is not null
         and truth_statement_text <> ''
-        and cloze_variants_json is not null
     `;
     if (since) {
       params.push(new Date(since));
@@ -282,7 +281,6 @@ router.get("/packs/:packId/cards", requireAuth, async (req, res) => {
          and content_pack_id = $1
          and truth_statement_text is not null
          and truth_statement_text <> ''
-         and cloze_variants_json is not null
        order by updated_at desc
        limit 500`,
       [packId]
@@ -295,83 +293,10 @@ router.get("/packs/:packId/cards", requireAuth, async (req, res) => {
 });
 
 router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) => {
-  try {
-    const body = req.body;
-    const incoming = Array.isArray(body) ? body : body.questions ?? body.cards ?? [];
-    if (!Array.isArray(incoming) || incoming.length === 0) {
-      return res.status(400).json({ error: "No questions found in payload." });
-    }
-
-    let inserted = 0;
-    let failed = 0;
-    const errors = [];
-    const skippedCloze = [];
-
-    for (const raw of incoming) {
-      try {
-        const q = normalizeIncomingQuestion(raw);
-        if (!isNonEmptyString(q.stableId)) {
-          throw new Error("stableId/stable_id is required");
-        }
-        if (!isNonEmptyString(q.truthStatementText)) {
-          throw new Error("truthStatementText/truth_statement_text is required");
-        }
-        if (q.clozeVariants != null) {
-          const validation = validateClozeVariants(q.clozeVariants);
-          if (!validation.ok) {
-            skippedCloze.push(q.stableId);
-            q.clozeVariants = null;
-          }
-        }
-        const clozeForPostgres = normalizeJSONForPostgres(q.clozeVariants, "seed.cloze_variants_json");
-
-        await query(
-          `insert into study_question
-             (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
-              truth_statement_text, cloze_variants_json, source_origin, status, created_at, updated_at)
-           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-           on conflict (stable_id) do update set
-             content_pack_id      = excluded.content_pack_id,
-             topic                = excluded.topic,
-             tags                 = excluded.tags,
-             prompt_text          = excluded.prompt_text,
-             answer_text          = excluded.answer_text,
-             truth_statement_text = excluded.truth_statement_text,
-             cloze_variants_json  = excluded.cloze_variants_json,
-             source_origin        = excluded.source_origin,
-             status               = excluded.status,
-             updated_at           = now()`,
-          [
-            q.id,
-            q.stableId,
-            q.contentPackId,
-            q.topic,
-            q.tags,
-            q.promptText,
-            q.answerText,
-            q.truthStatementText,
-            clozeForPostgres.value,
-            q.sourceOrigin,
-            q.status,
-            q.createdAt,
-            q.updatedAt,
-          ]
-        );
-        inserted += 1;
-      } catch (err) {
-        failed += 1;
-        errors.push({
-          stableId: raw.stable_id ?? raw.stableId ?? null,
-          error: err.message,
-        });
-      }
-    }
-
-    res.json({ inserted, upserted: inserted, failed, errors, skippedCloze });
-  } catch (err) {
-    console.error("[seed] top-level error:", err);
-    res.status(500).json({ error: "Seed failed", detail: err.message });
-  }
+  console.warn("[seed] rejected direct canonical seed attempt; submissions/moderation is the only creation path");
+  res.status(410).json({
+    error: "Direct canonical seeding is disabled. Create study_submission rows and approve them through moderation.",
+  });
 });
 
 router.post("/admin/questions/delete", requireAuth, requireRole("owner"), async (req, res) => {
@@ -472,7 +397,7 @@ router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (r
        where stable_id = $1
          and submitter_id = $2
          and reason = 'new-card'
-         and status in ('pending', 'approved')
+         and status = 'pending'
        order by created_at desc
        limit 1`,
       [usedStableId, req.user.sub]
@@ -492,7 +417,7 @@ router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (r
       answerText ?? "",
       truthStatementText ?? "",
       authoredText ?? null,
-      parsedCloze.value,
+      null,
       parsedProposedCloze.value,
       req.user.sub,
       submitterAlias ?? "anonymous",
@@ -522,6 +447,11 @@ router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (r
        values ($1,null,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'new-card',$14,'pending')`,
       insertValues
     );
+    console.log("[new-card] created study_submission only", {
+      submissionId,
+      stableId: usedStableId,
+      origin: "local pending submission",
+    });
 
     res.json({ id: submissionId });
   } catch (err) {
@@ -630,9 +560,11 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
     if (!isNonEmptyString(question.truth_statement_text)) {
       return res.status(400).json({ error: "Cannot approve without truth_statement_text." });
     }
-    const clozeValidation = validateClozeVariants(question.cloze_variants_json);
-    if (!clozeValidation.ok) {
-      return res.status(400).json({ error: `Cannot approve: ${clozeValidation.error}` });
+    if (question.cloze_variants_json != null) {
+      const clozeValidation = validateClozeVariants(question.cloze_variants_json);
+      if (!clozeValidation.ok) {
+        return res.status(400).json({ error: "Cannot approve: " + clozeValidation.error });
+      }
     }
     const approvedCloze = normalizeJSONForPostgres(question.cloze_variants_json, "approval.cloze_variants_json");
     if (!approvedCloze.ok) {
@@ -643,6 +575,12 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
     if (!question.question_id) {
       const questionId = crypto.randomUUID();
       const stableId = isNonEmptyString(question.stable_id) ? question.stable_id : crypto.randomUUID();
+      console.log("[approve] creating canonical study_question from moderation approval", {
+        submissionId: id,
+        questionId,
+        stableId,
+        origin: "moderation approval",
+      });
       const insertedQuestion = await query(
         `insert into study_question
            (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text, truth_statement_text,
@@ -676,11 +614,18 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
         insertedQuestion.rows[0].id,
         id,
       ]);
+    } else {
+      console.log("[approve] publishing existing canonical question from moderation approval", {
+        submissionId: id,
+        questionId: question.question_id,
+        stableId: question.stable_id,
+        origin: "moderation approval",
+      });
     }
 
     await query(
       `update study_question
-       set cloze_variants_json = $2,
+       set cloze_variants_json = coalesce($2, cloze_variants_json),
            status = 'published',
            updated_at = now()
        where id = (select question_id from study_submission where id = $1)`,
