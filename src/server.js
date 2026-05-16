@@ -13,6 +13,19 @@ process.on("unhandledRejection", (reason) => {
 const app = express();
 
 app.use(cors());
+app.use((req, res, next) => {
+  if (req.method === "POST" && req.path === "/api/submissions/new-card") {
+    console.log("[new-card] request received before body parsing", {
+      commitSha: deploymentInfo.commitSha,
+      deploymentTimestamp: deploymentInfo.deploymentTimestamp,
+      environment: deploymentInfo.environment,
+      contentType: req.headers["content-type"] ?? null,
+      contentLength: req.headers["content-length"] ?? null,
+      hasAuthorization: Boolean(req.headers.authorization),
+    });
+  }
+  next();
+});
 app.use(express.json({ limit: "10mb" }));
 app.use("/api", router);
 
@@ -26,6 +39,9 @@ app.use((req, res) => {
 app.use((err, req, res, next) => {
   console.error(`[unhandled error] ${req.method} ${req.path}`, err);
   if (!res.headersSent) {
+    if (err instanceof SyntaxError && "body" in err) {
+      return res.status(400).json({ error: "Malformed JSON request body" });
+    }
     res.status(500).json({ error: "Internal server error" });
   }
 });
