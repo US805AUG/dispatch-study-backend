@@ -28,7 +28,16 @@ create table if not exists study_question (
 
 create table if not exists study_submission (
   id uuid primary key,
-  question_id uuid references study_question(id),
+  question_id uuid,
+  stable_id text,
+  content_pack_id text,
+  topic text,
+  tags text[],
+  prompt_text text,
+  answer_text text,
+  truth_statement_text text,
+  authored_text text,
+  cloze_variants_json jsonb,
   submitter_id uuid references app_user(id),
   submitter_alias text,
   reason text,
@@ -49,8 +58,12 @@ create table if not exists moderation_event (
 );
 
 create index if not exists idx_submission_status on study_submission(status);
+create index if not exists idx_submission_question_id on study_submission(question_id);
+create index if not exists idx_submission_stable_id on study_submission(stable_id);
 create index if not exists idx_question_status on study_question(status);
 create index if not exists idx_question_updated on study_question(updated_at);
 
 -- Migration: run once in Railway SQL editor if the table already exists
 -- alter table study_question add column if not exists source_origin text default '';
+-- alter table study_submission drop constraint if exists study_submission_question_id_fkey;
+-- alter table study_submission alter column question_id drop not null;

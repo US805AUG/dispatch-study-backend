@@ -33,6 +33,19 @@ app.use((err, req, res, next) => {
 async function runMigrations() {
   await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS source_origin text DEFAULT ''");
   await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS proposed_cloze_variants_json jsonb");
+  await query("ALTER TABLE study_submission DROP CONSTRAINT IF EXISTS study_submission_question_id_fkey");
+  await query("ALTER TABLE study_submission ALTER COLUMN question_id DROP NOT NULL");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS stable_id text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS content_pack_id text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS topic text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS tags text[]");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS prompt_text text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS answer_text text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS truth_statement_text text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS authored_text text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS cloze_variants_json jsonb");
+  await query("CREATE INDEX IF NOT EXISTS idx_submission_question_id ON study_submission(question_id)");
+  await query("CREATE INDEX IF NOT EXISTS idx_submission_stable_id ON study_submission(stable_id)");
   console.log("Migrations complete.");
 }
 

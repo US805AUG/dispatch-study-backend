@@ -1,37 +1,132 @@
 import express from "express";
 import crypto from "crypto";
-import { verifyAppleIdentityToken, upsertUserFromApplePayload, issueJwt, requireAuth, requireRole } from "./auth.js";
+import {
+  verifyAppleIdentityToken,
+  upsertUserFromApplePayload,
+  issueJwt,
+  requireAuth,
+  requireRole,
+} from "./auth.js";
 import { query } from "./db.js";
 
 export const router = express.Router();
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// Normalise a cloze value from a request body to a valid JSON string or null.
-// Accepts an already-parsed object (Express did the work) or a raw JSON string.
-// Returns null if the value is absent or invalid so we never send bad data to Postgres.
-function parseClozeJson(value) {
-  if (value === undefined || value === null) return null;
-  const str = typeof value === "string" ? value : JSON.stringify(value);
-  try {
-    JSON.parse(str);
-    return str;
-  } catch {
-    return null;
+function parseJSONValue(value) {
+  if (value == null) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    return JSON.parse(trimmed);
   }
+  if (typeof value === "object") return value;
+  throw new Error("Invalid JSON value");
 }
 
-// ---------------------------------------------------------------------------
-// Public / unauthenticated
-// ---------------------------------------------------------------------------
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isUUID(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function validateClozeVariants(variants) {
+  if (!Array.isArray(variants) || variants.length === 0) {
+    return { ok: false, error: "cloze_variants_json must be a non-empty array." };
+  }
+
+  const difficulties = new Set();
+  for (const variant of variants) {
+    if (typeof variant !== "object" || variant == null) {
+      return { ok: false, error: "Each cloze variant must be an object." };
+    }
+    if (!isNonEmptyString(variant.baseText) || !isNonEmptyString(variant.maskedText)) {
+      return { ok: false, error: "Each cloze variant needs non-empty baseText and maskedText." };
+    }
+    if (!isNonEmptyString(variant.difficulty)) {
+      return { ok: false, error: "Each cloze variant needs difficulty." };
+    }
+    difficulties.add(String(variant.difficulty).toLowerCase());
+  }
+
+  const hasStandard = difficulties.has("easy") || difficulties.has("medium");
+  const hasDeep = difficulties.has("hard");
+  if (!hasStandard || !hasDeep) {
+    return { ok: false, error: "Cloze variants must include standard (easy/medium) and deep (hard)." };
+  }
+  return { ok: true };
+}
+
+function compactPayloadForLog(body) {
+  return {
+    stableId: body?.stableId ?? body?.stable_id ?? null,
+    questionId: body?.questionId ?? body?.question_id ?? null,
+    contentPackId: body?.contentPackId ?? body?.content_pack_id ?? null,
+    topic: body?.topic ?? null,
+    tagsCount: Array.isArray(body?.tags) ? body.tags.length : 0,
+    hasPromptText: isNonEmptyString(body?.promptText ?? body?.prompt_text),
+    hasAnswerText: isNonEmptyString(body?.answerText ?? body?.answer_text),
+    hasTruthStatementText: isNonEmptyString(body?.truthStatementText ?? body?.truth_statement_text),
+    hasClozeVariantsJson:
+      body?.clozeVariantsJson != null ||
+      body?.cloze_variants_json != null ||
+      body?.proposedClozeVariantsJson != null ||
+      body?.proposed_cloze_variants_json != null,
+  };
+}
+
+function serializeQuestionRow(row) {
+  return {
+    ...row,
+    cloze_variants_json: row.cloze_variants_json ? JSON.stringify(row.cloze_variants_json) : null,
+  };
+}
+
+function normalizeIncomingQuestion(input) {
+  const stableId = input.stable_id ?? input.stableId ?? null;
+  const truthStatementText = input.truth_statement_text ?? input.truthStatementText ?? "";
+  const promptText = input.prompt_text ?? input.promptText ?? "";
+  const answerText = input.answer_text ?? input.answerText ?? "";
+  const clozeRaw = input.cloze_variants_json ?? input.clozeVariantsJson ?? null;
+  const clozeVariants = parseJSONValue(clozeRaw);
+
+  return {
+    id: input.id ?? crypto.randomUUID(),
+    stableId,
+    contentPackId: input.content_pack_id ?? input.contentPackId ?? null,
+    topic: input.topic ?? "",
+    tags: Array.isArray(input.tags) ? input.tags : [],
+    promptText,
+    answerText,
+    truthStatementText,
+    clozeVariants,
+    sourceOrigin: input.source_origin ?? input.sourceOrigin ?? "",
+    status: input.status ?? "published",
+    createdAt: input.created_at ?? input.createdAt ?? new Date().toISOString(),
+    updatedAt: input.updated_at ?? input.updatedAt ?? new Date().toISOString(),
+  };
+}
+
+function parseOptionalClozeForResponse(value, res) {
+  try {
+    const parsed = parseJSONValue(value);
+    if (parsed == null) return { ok: true, value: null };
+    const validation = validateClozeVariants(parsed);
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error });
+      return { ok: false, value: null };
+    }
+    return { ok: true, value: parsed };
+  } catch {
+    res.status(400).json({ error: "clozeVariantsJson must be valid JSON." });
+    return { ok: false, value: null };
+  }
+}
 
 router.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-// App version gating — bump minRequiredVersion to force updates
 router.get("/config", (req, res) => {
   res.json({
     minRequiredVersion: process.env.MIN_REQUIRED_VERSION ?? "1.0.0",
@@ -52,28 +147,28 @@ router.post("/auth/apple", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Question sync
-// ---------------------------------------------------------------------------
-
-// Incremental sync — iOS passes ?since=<ISO date> to fetch only updates.
-// cloze_variants_json is re-serialised from JSONB → string so Swift always gets a string.
 router.get("/questions", async (req, res) => {
   try {
     const { since } = req.query;
     const params = [];
-    let sql = "select * from study_question where status = 'published'";
+    let sql = `
+      select *
+      from study_question
+      where status = 'published'
+        and truth_statement_text is not null
+        and truth_statement_text <> ''
+        and cloze_variants_json is not null
+    `;
     if (since) {
       params.push(new Date(since));
       sql += ` and updated_at > $${params.length}`;
     }
     sql += " order by updated_at desc limit 2000";
     const { rows } = await query(sql, params);
-    const questions = rows.map((r) => ({
-      ...r,
-      cloze_variants_json: r.cloze_variants_json ? JSON.stringify(r.cloze_variants_json) : null,
-    }));
-    res.json({ questions, synced_at: new Date().toISOString() });
+    res.json({
+      questions: rows.map(serializeQuestionRow),
+      synced_at: new Date().toISOString(),
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });
@@ -84,40 +179,52 @@ router.get("/packs/:packId/cards", requireAuth, async (req, res) => {
   try {
     const { packId } = req.params;
     const { rows } = await query(
-      "select * from study_question where status = 'published' and content_pack_id = $1 order by updated_at desc limit 500",
+      `select *
+       from study_question
+       where status = 'published'
+         and content_pack_id = $1
+         and truth_statement_text is not null
+         and truth_statement_text <> ''
+         and cloze_variants_json is not null
+       order by updated_at desc
+       limit 500`,
       [packId]
     );
-    res.json({ cards: rows });
+    res.json({ cards: rows.map(serializeQuestionRow) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ---------------------------------------------------------------------------
-// Owner: seed
-// ---------------------------------------------------------------------------
-
-// Bulk upsert of an authored question bank.
-// cloze_variants_json contains the owner-curated easy/hard variants and IS stored
-// on the server so all clients receive the same curated variants on sync.
-// Invalid cloze JSON is skipped (set to null) rather than failing the whole seed.
 router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) => {
   try {
-    const { questions } = req.body;
-    if (!Array.isArray(questions) || questions.length === 0) {
-      return res.status(400).json({ error: "questions array required" });
+    const body = req.body;
+    const incoming = Array.isArray(body) ? body : body.questions ?? body.cards ?? [];
+    if (!Array.isArray(incoming) || incoming.length === 0) {
+      return res.status(400).json({ error: "No questions found in payload." });
     }
 
-    let upserted = 0;
+    let inserted = 0;
     let failed = 0;
+    const errors = [];
     const skippedCloze = [];
 
-    for (const q of questions) {
+    for (const raw of incoming) {
       try {
-        const clozeJson = parseClozeJson(q.clozeVariantsJson ?? q.cloze_variants_json);
-        if ((q.clozeVariantsJson ?? q.cloze_variants_json) && clozeJson === null) {
-          skippedCloze.push(q.stableId ?? q.stable_id);
+        const q = normalizeIncomingQuestion(raw);
+        if (!isNonEmptyString(q.stableId)) {
+          throw new Error("stableId/stable_id is required");
+        }
+        if (!isNonEmptyString(q.truthStatementText)) {
+          throw new Error("truthStatementText/truth_statement_text is required");
+        }
+        if (q.clozeVariants != null) {
+          const validation = validateClozeVariants(q.clozeVariants);
+          if (!validation.ok) {
+            skippedCloze.push(q.stableId);
+            q.clozeVariants = null;
+          }
         }
 
         await query(
@@ -126,6 +233,7 @@ router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) =
               truth_statement_text, cloze_variants_json, source_origin, status, created_at, updated_at)
            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
            on conflict (stable_id) do update set
+             content_pack_id      = excluded.content_pack_id,
              topic                = excluded.topic,
              tags                 = excluded.tags,
              prompt_text          = excluded.prompt_text,
@@ -133,101 +241,136 @@ router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) =
              truth_statement_text = excluded.truth_statement_text,
              cloze_variants_json  = excluded.cloze_variants_json,
              source_origin        = excluded.source_origin,
-             updated_at           = excluded.updated_at`,
+             status               = excluded.status,
+             updated_at           = now()`,
           [
-            crypto.randomUUID(),
-            q.stableId ?? q.stable_id,
-            q.contentPackId ?? q.content_pack_id ?? null,
-            q.topic ?? "",
-            q.tags ?? [],
-            q.promptText ?? q.prompt_text ?? "",
-            q.answerText ?? q.answer_text ?? "",
-            q.truthStatementText ?? q.truth_statement_text ?? "",
-            clozeJson,
-            q.sourceOrigin ?? q.source_origin ?? "",
-            q.status ?? "published",
-            q.createdAt ?? q.created_at ?? new Date(),
-            q.updatedAt ?? q.updated_at ?? new Date(),
+            q.id,
+            q.stableId,
+            q.contentPackId,
+            q.topic,
+            q.tags,
+            q.promptText,
+            q.answerText,
+            q.truthStatementText,
+            q.clozeVariants,
+            q.sourceOrigin,
+            q.status,
+            q.createdAt,
+            q.updatedAt,
           ]
         );
-        upserted++;
+        inserted += 1;
       } catch (err) {
-        console.error(`[seed] failed on stableId=${q.stableId ?? q.stable_id}:`, err.message);
-        failed++;
+        failed += 1;
+        errors.push({
+          stableId: raw.stable_id ?? raw.stableId ?? null,
+          error: err.message,
+        });
       }
     }
 
-    res.json({ upserted, failed, skippedCloze });
+    res.json({ inserted, upserted: inserted, failed, errors, skippedCloze });
   } catch (err) {
-    console.error("[seed]", err);
+    console.error("[seed] top-level error:", err);
     res.status(500).json({ error: "Seed failed", detail: err.message });
   }
 });
 
-// ---------------------------------------------------------------------------
-// User submissions (crowdsourced edits and new cards)
-// ---------------------------------------------------------------------------
-
-// User proposes a cloze edit to an existing published question.
-// proposedClozeVariantsJson is stored on the submission for owner review.
-// Nothing on study_question changes until the owner approves.
-router.post("/submissions", requireAuth, async (req, res) => {
+router.post("/admin/questions/delete", requireAuth, requireRole("owner"), async (req, res) => {
   try {
-    const { questionId, reason, note, proposedClozeVariantsJson } = req.body;
-    const clozeJson = parseClozeJson(proposedClozeVariantsJson);
-    const submissionId = crypto.randomUUID();
-    await query(
-      `insert into study_submission
-         (id, question_id, submitter_id, submitter_alias, reason, note, proposed_cloze_variants_json, status)
-       values ($1,$2,$3,'anonymous',$4,$5,$6,'pending')`,
-      [submissionId, questionId, req.user.sub, reason ?? "", note ?? "", clozeJson]
+    const stableId = req.body?.stableId ?? req.body?.stable_id;
+    if (!isNonEmptyString(stableId)) {
+      return res.status(400).json({ error: "stableId is required" });
+    }
+
+    const { rowCount } = await query(
+      `update study_question
+       set status = 'archived', updated_at = now()
+       where stable_id = $1`,
+      [stableId]
     );
-    res.json({ id: submissionId });
+    if (rowCount === 0) return res.status(404).json({ error: "Question not found" });
+    res.json({ ok: true });
   } catch (err) {
-    console.error(err);
+    console.error("[admin/questions/delete]", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// User submits a brand-new card for owner review.
-// The question is inserted as pending (hidden from sync) until approved.
 router.post("/submissions/new-card", requireAuth, async (req, res) => {
   try {
-    const { stableId, promptText, answerText, truthStatementText, topic, tags, submitterAlias, proposedClozeVariantsJson } = req.body;
-    if (!truthStatementText && !promptText) {
+    const {
+      stableId,
+      contentPackId,
+      promptText,
+      answerText,
+      truthStatementText,
+      authoredText,
+      clozeVariantsJson,
+      proposedClozeVariantsJson,
+      topic,
+      tags,
+      submitterAlias,
+    } = req.body;
+    const incomingQuestionId = req.body?.questionId ?? req.body?.question_id ?? null;
+    console.log("[new-card] incoming payload", compactPayloadForLog(req.body));
+    console.log("[new-card] question_id presence", {
+      hasQuestionId: isNonEmptyString(incomingQuestionId),
+      mode: "new-card",
+    });
+    if (!isNonEmptyString(truthStatementText) && !isNonEmptyString(promptText)) {
       return res.status(400).json({ error: "truthStatementText or promptText required" });
     }
 
-    const questionId = crypto.randomUUID();
-    const usedStableId = stableId ?? crypto.randomUUID();
-    const clozeJson = parseClozeJson(proposedClozeVariantsJson);
+    const clozeRaw =
+      clozeVariantsJson ??
+      req.body?.cloze_variants_json ??
+      proposedClozeVariantsJson ??
+      req.body?.proposed_cloze_variants_json;
+    const parsedCloze = parseOptionalClozeForResponse(clozeRaw, res);
+    if (!parsedCloze.ok) return;
 
-    await query(
-      `insert into study_question
-         (id, stable_id, topic, tags, prompt_text, answer_text,
-          truth_statement_text, source_origin, status, created_at, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,'user-submission','pending',now(),now())
-       on conflict (stable_id) do update set
-         topic                = excluded.topic,
-         prompt_text          = excluded.prompt_text,
-         answer_text          = excluded.answer_text,
-         truth_statement_text = excluded.truth_statement_text,
-         updated_at           = now()`,
-      [questionId, usedStableId, topic ?? "", tags ?? [], promptText ?? "", answerText ?? "", truthStatementText ?? ""]
+    const usedStableId = isNonEmptyString(stableId) ? stableId.trim() : crypto.randomUUID();
+    console.log("[new-card] treating submission as brand-new card", {
+      stableId: usedStableId,
+      questionId: null,
+    });
+
+    const existingSubmission = await query(
+      `select id
+       from study_submission
+       where stable_id = $1
+         and submitter_id = $2
+         and reason = 'new-card'
+         and status in ('pending', 'approved')
+       order by created_at desc
+       limit 1`,
+      [usedStableId, req.user.sub]
     );
+    if (existingSubmission.rows.length > 0) {
+      return res.json({ id: existingSubmission.rows[0].id, duplicate: true });
+    }
 
     const submissionId = crypto.randomUUID();
     await query(
       `insert into study_submission
-         (id, question_id, submitter_id, submitter_alias, reason, note, proposed_cloze_variants_json, status)
-       values ($1,$2,$3,$4,'new-card',$5,$6,'pending')`,
+         (id, question_id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
+          truth_statement_text, authored_text, cloze_variants_json, submitter_id, submitter_alias, reason, note, status)
+       values ($1,null,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'new-card',$13,'pending')`,
       [
         submissionId,
-        questionId,
+        usedStableId,
+        contentPackId ?? null,
+        topic ?? "",
+        Array.isArray(tags) ? tags : [],
+        promptText ?? "",
+        answerText ?? "",
+        truthStatementText ?? "",
+        authoredText ?? null,
+        parsedCloze.value,
         req.user.sub,
         submitterAlias ?? "anonymous",
         `New card: ${(truthStatementText ?? promptText ?? "").substring(0, 120)}`,
-        clozeJson,
       ]
     );
 
@@ -238,51 +381,158 @@ router.post("/submissions/new-card", requireAuth, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Moderation
-// ---------------------------------------------------------------------------
-
-router.get("/moderation/queue", requireAuth, requireRole("owner", "moderator"), async (req, res) => {
+router.post("/submissions", requireAuth, async (req, res) => {
   try {
-    const { rows } = await query(
-      `select ss.*, sq.prompt_text, sq.truth_statement_text, sq.cloze_variants_json
-       from study_submission ss
-       join study_question sq on sq.id = ss.question_id
-       where ss.status = 'pending'
-       order by ss.created_at desc limit 200`
+    const { reason, note, proposedClozeVariantsJson } = req.body;
+    const questionId = req.body?.questionId ?? req.body?.question_id;
+    console.log("[submissions] incoming payload", compactPayloadForLog(req.body));
+    console.log("[submissions] question_id presence", {
+      hasQuestionId: isNonEmptyString(questionId),
+      mode: "existing-question-edit",
+    });
+    if (!isNonEmptyString(questionId)) {
+      return res.status(400).json({ error: "questionId is required for existing-question submissions." });
+    }
+    if (!isUUID(questionId)) {
+      return res.status(400).json({ error: "questionId must be a valid UUID." });
+    }
+    const proposedCloze = parseOptionalClozeForResponse(
+      proposedClozeVariantsJson ?? req.body?.proposed_cloze_variants_json,
+      res
     );
-    res.json({ queue: rows });
+    if (!proposedCloze.ok) return;
+
+    const existingQuestion = await query("select id from study_question where id = $1 limit 1", [questionId]);
+    if (existingQuestion.rows.length === 0) {
+      return res.status(404).json({ error: "Question not found" });
+    }
+    const submissionId = crypto.randomUUID();
+    await query(
+      `insert into study_submission
+         (id, question_id, submitter_id, submitter_alias, reason, note, proposed_cloze_variants_json, status)
+       values ($1,$2,$3,'anonymous',$4,$5,$6,'pending')`,
+      [submissionId, questionId, req.user.sub, reason ?? "", note ?? "", proposedCloze.value]
+    );
+    res.json({ id: submissionId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Approve a submission:
-// - Applies proposed_cloze_variants_json to the question (if present)
-// - Publishes the question if it was pending (new card flow)
-// - Marks the submission approved
+router.get("/moderation/queue", requireAuth, requireRole("owner", "moderator"), async (req, res) => {
+  try {
+    const { rows } = await query(
+      `select
+         study_submission.*,
+         coalesce(study_submission.prompt_text, study_question.prompt_text) as prompt_text,
+         study_submission.authored_text as authored_text,
+         coalesce(study_submission.truth_statement_text, study_question.truth_statement_text) as truth_statement_text,
+         coalesce(
+           study_submission.proposed_cloze_variants_json,
+           study_submission.cloze_variants_json,
+           study_question.cloze_variants_json
+         ) as cloze_variants_json,
+         coalesce(study_submission.stable_id, study_question.stable_id) as stable_id
+       from study_submission
+       left join study_question on study_question.id = study_submission.question_id
+       where study_submission.status = 'pending'
+       order by study_submission.created_at desc
+       limit 200`
+    );
+    res.json({
+      queue: rows.map((row) => ({
+        ...row,
+        cloze_variants_json: row.cloze_variants_json ? JSON.stringify(row.cloze_variants_json) : null,
+      })),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "moderator"), async (req, res) => {
   try {
     const { id } = req.params;
+    const { rows } = await query(
+      `select
+         study_submission.question_id,
+         coalesce(study_submission.stable_id, study_question.stable_id) as stable_id,
+         coalesce(study_submission.content_pack_id, study_question.content_pack_id) as content_pack_id,
+         coalesce(study_submission.topic, study_question.topic) as topic,
+         coalesce(study_submission.tags, study_question.tags) as tags,
+         coalesce(study_submission.prompt_text, study_question.prompt_text) as prompt_text,
+         coalesce(study_submission.answer_text, study_question.answer_text) as answer_text,
+         coalesce(study_submission.truth_statement_text, study_question.truth_statement_text) as truth_statement_text,
+         coalesce(
+           study_submission.proposed_cloze_variants_json,
+           study_submission.cloze_variants_json,
+           study_question.cloze_variants_json
+         ) as cloze_variants_json
+       from study_submission
+       left join study_question on study_question.id = study_submission.question_id
+       where study_submission.id = $1`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Submission not found" });
+    const question = rows[0];
+
+    if (!isNonEmptyString(question.truth_statement_text)) {
+      return res.status(400).json({ error: "Cannot approve without truth_statement_text." });
+    }
+    const clozeValidation = validateClozeVariants(question.cloze_variants_json);
+    if (!clozeValidation.ok) {
+      return res.status(400).json({ error: `Cannot approve: ${clozeValidation.error}` });
+    }
+
+    if (!question.question_id) {
+      const questionId = crypto.randomUUID();
+      const stableId = isNonEmptyString(question.stable_id) ? question.stable_id : crypto.randomUUID();
+      const insertedQuestion = await query(
+        `insert into study_question
+           (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text, truth_statement_text,
+            cloze_variants_json, source_origin, status, created_at, updated_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'user-submission','published',now(),now())
+         on conflict (stable_id) do update set
+           content_pack_id       = coalesce(excluded.content_pack_id, study_question.content_pack_id),
+           topic                 = excluded.topic,
+           tags                  = excluded.tags,
+           prompt_text           = excluded.prompt_text,
+           answer_text           = excluded.answer_text,
+           truth_statement_text  = excluded.truth_statement_text,
+           cloze_variants_json   = coalesce(excluded.cloze_variants_json, study_question.cloze_variants_json),
+           source_origin         = excluded.source_origin,
+           status                = 'published',
+           updated_at            = now()
+         returning id`,
+        [
+          questionId,
+          stableId,
+          question.content_pack_id ?? null,
+          question.topic ?? "",
+          Array.isArray(question.tags) ? question.tags : [],
+          question.prompt_text ?? "",
+          question.answer_text ?? "",
+          question.truth_statement_text ?? "",
+          question.cloze_variants_json,
+        ]
+      );
+      await query("update study_submission set question_id = $1, updated_at = now() where id = $2", [
+        insertedQuestion.rows[0].id,
+        id,
+      ]);
+    }
 
     await query(
-      `update study_question set
-         cloze_variants_json = coalesce(
-           (select proposed_cloze_variants_json from study_submission where id = $1),
-           cloze_variants_json
-         ),
-         status = case when status = 'pending' then 'published' else status end,
-         updated_at = now()
+      `update study_question
+       set cloze_variants_json = $2,
+           status = 'published',
+           updated_at = now()
        where id = (select question_id from study_submission where id = $1)`,
-      [id]
+      [id, question.cloze_variants_json]
     );
-
-    await query(
-      "update study_submission set status = 'approved', updated_at = now() where id = $1",
-      [id]
-    );
-
+    await query("update study_submission set status = 'approved', updated_at = now() where id = $1", [id]);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -301,22 +551,31 @@ router.post("/moderation/:id/reject", requireAuth, requireRole("owner", "moderat
   }
 });
 
-// Owner manually edits question content before approving.
 router.post("/moderation/:id/edit", requireAuth, requireRole("owner", "moderator"), async (req, res) => {
   try {
     const { id } = req.params;
-    const { truthStatementText, clozeVariantsJson } = req.body;
-    const clozeJson = parseClozeJson(clozeVariantsJson);
-    if (clozeVariantsJson != null && clozeJson === null) {
-      return res.status(400).json({ error: "clozeVariantsJson is not valid JSON" });
-    }
+    const truthStatementText = req.body?.truthStatementText ?? req.body?.truth_statement_text;
+    const clozeVariantsJson = req.body?.clozeVariantsJson ?? req.body?.cloze_variants_json;
+
+    const clozePayload = parseOptionalClozeForResponse(clozeVariantsJson, res);
+    if (!clozePayload.ok) return;
+
     await query(
-      `update study_question set
-         truth_statement_text = coalesce($1, truth_statement_text),
-         cloze_variants_json  = coalesce($2, cloze_variants_json),
-         updated_at           = now()
+      `update study_question
+       set truth_statement_text = coalesce($1, truth_statement_text),
+           cloze_variants_json  = coalesce($2, cloze_variants_json),
+           updated_at = now()
        where id = (select question_id from study_submission where id = $3)`,
-      [truthStatementText ?? null, clozeJson, id]
+      [truthStatementText ?? null, clozePayload.value, id]
+    );
+    await query(
+      `update study_submission
+       set truth_statement_text = coalesce($1, truth_statement_text),
+           cloze_variants_json  = coalesce($2, cloze_variants_json),
+           updated_at = now()
+       where id = $3
+         and question_id is null`,
+      [truthStatementText ?? null, clozePayload.value, id]
     );
     res.json({ ok: true });
   } catch (err) {
@@ -324,10 +583,6 @@ router.post("/moderation/:id/edit", requireAuth, requireRole("owner", "moderator
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
-// ---------------------------------------------------------------------------
-// Owner: user management
-// ---------------------------------------------------------------------------
 
 router.get("/admin/users", requireAuth, requireRole("owner"), async (req, res) => {
   try {
