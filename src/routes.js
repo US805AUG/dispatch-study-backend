@@ -22,6 +22,99 @@ function parseJSONValue(value) {
   throw new Error("Invalid JSON value");
 }
 
+function previewValue(value) {
+  if (value == null) return null;
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  return text.length > 600 ? `${text.slice(0, 600)}...<truncated>` : text;
+}
+
+function normalizeJSONForPostgres(value, fieldName) {
+  const inputType = value == null ? "null" : typeof value;
+  const inputIsArray = Array.isArray(value);
+  const diagnostics = {
+    field: fieldName,
+    inputType,
+    inputIsArray,
+    parseAttempted: typeof value === "string",
+    parseSucceeded: value == null || typeof value !== "string",
+    finalType: "null",
+    finalIsArray: false,
+    finalValue: null,
+  };
+
+  let parsed = null;
+  if (value != null) {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed.length > 0) {
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (err) {
+          diagnostics.parseSucceeded = false;
+          diagnostics.parseError = err.message;
+          return { ok: false, value: null, diagnostics };
+        }
+      }
+    } else if (typeof value === "object") {
+      parsed = value;
+    } else {
+      diagnostics.parseSucceeded = false;
+      diagnostics.parseError = `Expected JSON string/object/array, received ${typeof value}`;
+      return { ok: false, value: null, diagnostics };
+    }
+  }
+
+  const pgValue = parsed == null ? null : JSON.stringify(parsed);
+  diagnostics.finalType = pgValue == null ? "null" : typeof pgValue;
+  diagnostics.finalIsArray = Array.isArray(parsed);
+  diagnostics.finalValue = previewValue(pgValue);
+  return { ok: true, value: pgValue, parsed, diagnostics };
+}
+
+function normalizeTagsForPostgres(value) {
+  const diagnostics = {
+    field: "tags",
+    inputType: value == null ? "null" : typeof value,
+    inputIsArray: Array.isArray(value),
+    parseAttempted: typeof value === "string",
+    parseSucceeded: value == null || typeof value !== "string",
+    finalType: "object",
+    finalIsArray: true,
+    finalValue: [],
+  };
+
+  let tags = [];
+  if (Array.isArray(value)) {
+    tags = value;
+  } else if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length > 0) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          tags = parsed;
+        } else {
+          diagnostics.parseSucceeded = false;
+          diagnostics.parseError = "Parsed tags value was not an array.";
+          return { ok: false, value: [], diagnostics };
+        }
+      } catch (err) {
+        diagnostics.parseSucceeded = false;
+        diagnostics.parseError = err.message;
+        return { ok: false, value: [], diagnostics };
+      }
+    }
+  } else if (value != null) {
+    diagnostics.parseSucceeded = false;
+    diagnostics.parseError = `Expected tags array or JSON string, received ${typeof value}`;
+    return { ok: false, value: [], diagnostics };
+  }
+
+  const normalized = tags.map((tag) => String(tag));
+  diagnostics.finalValue = normalized;
+  return { ok: true, value: normalized, diagnostics };
+}
+
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -108,19 +201,18 @@ function normalizeIncomingQuestion(input) {
 }
 
 function parseOptionalClozeForResponse(value, res) {
-  try {
-    const parsed = parseJSONValue(value);
-    if (parsed == null) return { ok: true, value: null };
-    const validation = validateClozeVariants(parsed);
-    if (!validation.ok) {
-      res.status(400).json({ error: validation.error });
-      return { ok: false, value: null };
-    }
-    return { ok: true, value: parsed };
-  } catch {
+  const normalized = normalizeJSONForPostgres(value, "cloze_variants_json");
+  if (!normalized.ok) {
     res.status(400).json({ error: "clozeVariantsJson must be valid JSON." });
-    return { ok: false, value: null };
+    return { ok: false, value: null, parsed: null, diagnostics: normalized.diagnostics };
   }
+  if (normalized.parsed == null) return { ok: true, value: null, parsed: null, diagnostics: normalized.diagnostics };
+  const validation = validateClozeVariants(normalized.parsed);
+  if (!validation.ok) {
+    res.status(400).json({ error: validation.error });
+    return { ok: false, value: null, parsed: null, diagnostics: normalized.diagnostics };
+  }
+  return normalized;
 }
 
 router.get("/health", (req, res) => {
@@ -226,6 +318,7 @@ router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) =
             q.clozeVariants = null;
           }
         }
+        const clozeForPostgres = normalizeJSONForPostgres(q.clozeVariants, "seed.cloze_variants_json");
 
         await query(
           `insert into study_question
@@ -252,7 +345,7 @@ router.post("/admin/seed", requireAuth, requireRole("owner"), async (req, res) =
             q.promptText,
             q.answerText,
             q.truthStatementText,
-            q.clozeVariants,
+            clozeForPostgres.value,
             q.sourceOrigin,
             q.status,
             q.createdAt,
@@ -329,11 +422,29 @@ router.post("/submissions/new-card", requireAuth, async (req, res) => {
       req.body?.proposed_cloze_variants_json;
     const parsedCloze = parseOptionalClozeForResponse(clozeRaw, res);
     if (!parsedCloze.ok) return;
+    const parsedProposedCloze = normalizeJSONForPostgres(
+      req.body?.proposedClozeVariantsJson ?? req.body?.proposed_cloze_variants_json ?? null,
+      "proposed_cloze_variants_json"
+    );
+    if (!parsedProposedCloze.ok) {
+      console.warn("[new-card] proposed cloze normalization failed", parsedProposedCloze.diagnostics);
+      return res.status(400).json({ error: "proposedClozeVariantsJson must be valid JSON." });
+    }
+    const normalizedTags = normalizeTagsForPostgres(tags);
+    if (!normalizedTags.ok) {
+      console.warn("[new-card] tags normalization failed", normalizedTags.diagnostics);
+      return res.status(400).json({ error: "tags must be an array or valid JSON array string." });
+    }
 
     const usedStableId = isNonEmptyString(stableId) ? stableId.trim() : crypto.randomUUID();
     console.log("[new-card] treating submission as brand-new card", {
       stableId: usedStableId,
       questionId: null,
+    });
+    console.log("[new-card] JSON field diagnostics", {
+      cloze_variants_json: parsedCloze.diagnostics,
+      proposed_cloze_variants_json: parsedProposedCloze.diagnostics,
+      tags: normalizedTags.diagnostics,
     });
 
     const existingSubmission = await query(
@@ -352,26 +463,45 @@ router.post("/submissions/new-card", requireAuth, async (req, res) => {
     }
 
     const submissionId = crypto.randomUUID();
+    const insertValues = [
+      submissionId,
+      usedStableId,
+      contentPackId ?? null,
+      topic ?? "",
+      normalizedTags.value,
+      promptText ?? "",
+      answerText ?? "",
+      truthStatementText ?? "",
+      authoredText ?? null,
+      parsedCloze.value,
+      parsedProposedCloze.value,
+      req.user.sub,
+      submitterAlias ?? "anonymous",
+      `New card: ${(truthStatementText ?? promptText ?? "").substring(0, 120)}`,
+    ];
+    console.log("[new-card] final pg insert values", {
+      id: insertValues[0],
+      stable_id: insertValues[1],
+      content_pack_id: insertValues[2],
+      topic: insertValues[3],
+      tags: insertValues[4],
+      prompt_text_type: typeof insertValues[5],
+      answer_text_type: typeof insertValues[6],
+      truth_statement_text_type: typeof insertValues[7],
+      authored_text_type: insertValues[8] == null ? "null" : typeof insertValues[8],
+      cloze_variants_json: previewValue(insertValues[9]),
+      proposed_cloze_variants_json: previewValue(insertValues[10]),
+      submitter_id: insertValues[11],
+      submitter_alias: insertValues[12],
+      note: insertValues[13],
+    });
     await query(
       `insert into study_submission
          (id, question_id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
-          truth_statement_text, authored_text, cloze_variants_json, submitter_id, submitter_alias, reason, note, status)
-       values ($1,null,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'new-card',$13,'pending')`,
-      [
-        submissionId,
-        usedStableId,
-        contentPackId ?? null,
-        topic ?? "",
-        Array.isArray(tags) ? tags : [],
-        promptText ?? "",
-        answerText ?? "",
-        truthStatementText ?? "",
-        authoredText ?? null,
-        parsedCloze.value,
-        req.user.sub,
-        submitterAlias ?? "anonymous",
-        `New card: ${(truthStatementText ?? promptText ?? "").substring(0, 120)}`,
-      ]
+          truth_statement_text, authored_text, cloze_variants_json, proposed_cloze_variants_json,
+          submitter_id, submitter_alias, reason, note, status)
+       values ($1,null,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'new-card',$14,'pending')`,
+      insertValues
     );
 
     res.json({ id: submissionId });
@@ -485,6 +615,11 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
     if (!clozeValidation.ok) {
       return res.status(400).json({ error: `Cannot approve: ${clozeValidation.error}` });
     }
+    const approvedCloze = normalizeJSONForPostgres(question.cloze_variants_json, "approval.cloze_variants_json");
+    if (!approvedCloze.ok) {
+      console.warn("[approve] cloze normalization failed", approvedCloze.diagnostics);
+      return res.status(400).json({ error: "Cannot approve: cloze_variants_json must be valid JSON." });
+    }
 
     if (!question.question_id) {
       const questionId = crypto.randomUUID();
@@ -515,7 +650,7 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
           question.prompt_text ?? "",
           question.answer_text ?? "",
           question.truth_statement_text ?? "",
-          question.cloze_variants_json,
+          approvedCloze.value,
         ]
       );
       await query("update study_submission set question_id = $1, updated_at = now() where id = $2", [
@@ -530,7 +665,7 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
            status = 'published',
            updated_at = now()
        where id = (select question_id from study_submission where id = $1)`,
-      [id, question.cloze_variants_json]
+      [id, approvedCloze.value]
     );
     await query("update study_submission set status = 'approved', updated_at = now() where id = $1", [id]);
     res.json({ ok: true });
