@@ -151,6 +151,14 @@ function validateClozeVariants(variants) {
   return { ok: true };
 }
 
+function normalizedContentHash(promptText, answerText, truthStatementText) {
+  const normalized = [promptText, answerText, truthStatementText]
+    .map((value) => String(value ?? "").trim().toLowerCase().replace(/\s+/g, " "))
+    .filter(Boolean)
+    .join("|");
+  return crypto.createHash("sha256").update(normalized).digest("hex");
+}
+
 function compactPayloadForLog(body) {
   return {
     stableId: body?.stableId ?? body?.stable_id ?? null,
@@ -161,6 +169,9 @@ function compactPayloadForLog(body) {
     hasPromptText: isNonEmptyString(body?.promptText ?? body?.prompt_text),
     hasAnswerText: isNonEmptyString(body?.answerText ?? body?.answer_text),
     hasTruthStatementText: isNonEmptyString(body?.truthStatementText ?? body?.truth_statement_text),
+    contentHash: body?.contentHash ?? body?.content_hash ?? null,
+    canonicalStableId: body?.canonicalStableId ?? body?.canonical_stable_id ?? null,
+    basedOnQuestionId: body?.basedOnQuestionId ?? body?.based_on_question_id ?? null,
     hasClozeVariantsJson:
       body?.clozeVariantsJson != null ||
       body?.cloze_variants_json != null ||
@@ -195,6 +206,14 @@ function normalizeIncomingQuestion(input) {
     truthStatementText,
     clozeVariants,
     sourceOrigin: input.source_origin ?? input.sourceOrigin ?? "",
+    createdByUserId: input.created_by_user_id ?? input.createdByUserId ?? null,
+    canonicalStableId: input.canonical_stable_id ?? input.canonicalStableId ?? null,
+    basedOnQuestionId: input.based_on_question_id ?? input.basedOnQuestionId ?? null,
+    moderationStatus: input.moderation_status ?? input.moderationStatus ?? null,
+    contentHash: input.content_hash ?? input.contentHash ?? normalizedContentHash(promptText, answerText, truthStatementText),
+    isLocalOnly: input.is_local_only ?? input.isLocalOnly ?? false,
+    isCommunityQuestion: input.is_community_question ?? input.isCommunityQuestion ?? true,
+    submittedToCommunityAt: input.submitted_to_community_at ?? input.submittedToCommunityAt ?? null,
     status: input.status ?? "published",
     createdAt: input.created_at ?? input.createdAt ?? new Date().toISOString(),
     updatedAt: input.updated_at ?? input.updatedAt ?? new Date().toISOString(),
@@ -348,6 +367,9 @@ router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (r
       topic,
       tags,
       submitterAlias,
+      contentHash,
+      canonicalStableId,
+      basedOnQuestionId,
     } = req.body;
     const incomingQuestionId = req.body?.questionId ?? req.body?.question_id ?? null;
     console.log("[new-card] incoming payload", compactPayloadForLog(req.body));
@@ -381,6 +403,15 @@ router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (r
     }
 
     const usedStableId = isNonEmptyString(stableId) ? stableId.trim() : crypto.randomUUID();
+    const usedContentHash = isNonEmptyString(contentHash)
+      ? contentHash.trim()
+      : normalizedContentHash(promptText ?? "", answerText ?? "", truthStatementText ?? "");
+    const usedCanonicalStableId = isNonEmptyString(canonicalStableId ?? req.body?.canonical_stable_id)
+      ? String(canonicalStableId ?? req.body?.canonical_stable_id).trim()
+      : null;
+    const usedBasedOnQuestionId = isNonEmptyString(basedOnQuestionId ?? req.body?.based_on_question_id)
+      ? String(basedOnQuestionId ?? req.body?.based_on_question_id).trim()
+      : null;
     console.log("[new-card] treating submission as brand-new card", {
       stableId: usedStableId,
       questionId: null,
@@ -394,13 +425,13 @@ router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (r
     const existingSubmission = await query(
       `select id
        from study_submission
-       where stable_id = $1
-         and submitter_id = $2
+       where submitter_id = $1
          and reason = 'new-card'
-         and status = 'pending'
+         and status in ('pending', 'approved')
+         and (stable_id = $2 or content_hash = $3)
        order by created_at desc
        limit 1`,
-      [usedStableId, req.user.sub]
+      [req.user.sub, usedStableId, usedContentHash]
     );
     if (existingSubmission.rows.length > 0) {
       return res.json({ id: existingSubmission.rows[0].id, duplicate: true });
@@ -422,6 +453,9 @@ router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (r
       req.user.sub,
       submitterAlias ?? "anonymous",
       `New card: ${(truthStatementText ?? promptText ?? "").substring(0, 120)}`,
+      usedContentHash,
+      usedCanonicalStableId,
+      usedBasedOnQuestionId,
     ];
     console.log("[new-card] final pg insert values", {
       id: insertValues[0],
@@ -438,13 +472,16 @@ router.post("/submissions/new-card", logNewCardRouteEntry, requireAuth, async (r
       submitter_id: insertValues[11],
       submitter_alias: insertValues[12],
       note: insertValues[13],
+      content_hash: insertValues[14],
+      canonical_stable_id: insertValues[15],
+      based_on_question_id: insertValues[16],
     });
     await query(
       `insert into study_submission
          (id, question_id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
           truth_statement_text, authored_text, cloze_variants_json, proposed_cloze_variants_json,
-          submitter_id, submitter_alias, reason, note, status)
-       values ($1,null,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'new-card',$14,'pending')`,
+          submitter_id, submitter_alias, reason, note, status, content_hash, canonical_stable_id, based_on_question_id)
+       values ($1,null,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'new-card',$14,'pending',$15,$16,$17)`,
       insertValues
     );
     console.log("[new-card] created study_submission only", {
@@ -512,7 +549,10 @@ router.get("/moderation/queue", requireAuth, requireRole("owner", "moderator"), 
            study_submission.cloze_variants_json,
            study_question.cloze_variants_json
          ) as cloze_variants_json,
-         coalesce(study_submission.stable_id, study_question.stable_id) as stable_id
+         coalesce(study_submission.stable_id, study_question.stable_id) as stable_id,
+         study_submission.content_hash as content_hash,
+         study_submission.canonical_stable_id as canonical_stable_id,
+         study_submission.based_on_question_id as based_on_question_id
        from study_submission
        left join study_question on study_question.id = study_submission.question_id
        where study_submission.status = 'pending'
@@ -537,7 +577,11 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
     const { rows } = await query(
       `select
          study_submission.question_id,
+         study_submission.submitter_id,
          coalesce(study_submission.stable_id, study_question.stable_id) as stable_id,
+         study_submission.content_hash as content_hash,
+         study_submission.canonical_stable_id as canonical_stable_id,
+         study_submission.based_on_question_id as based_on_question_id,
          coalesce(study_submission.content_pack_id, study_question.content_pack_id) as content_pack_id,
          coalesce(study_submission.topic, study_question.topic) as topic,
          coalesce(study_submission.tags, study_question.tags) as tags,
@@ -584,8 +628,9 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
       const insertedQuestion = await query(
         `insert into study_question
            (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text, truth_statement_text,
-            cloze_variants_json, source_origin, status, created_at, updated_at)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'user-submission','published',now(),now())
+            cloze_variants_json, source_origin, status, created_by_user_id, canonical_stable_id, based_on_question_id,
+            moderation_status, content_hash, is_local_only, is_community_question, submitted_to_community_at, created_at, updated_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'user-submission','published',$10,$11,$12,'published',$13,false,true,now(),now(),now())
          on conflict (stable_id) do update set
            content_pack_id       = coalesce(excluded.content_pack_id, study_question.content_pack_id),
            topic                 = excluded.topic,
@@ -596,6 +641,14 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
            cloze_variants_json   = coalesce(excluded.cloze_variants_json, study_question.cloze_variants_json),
            source_origin         = excluded.source_origin,
            status                = 'published',
+           created_by_user_id    = coalesce(study_question.created_by_user_id, excluded.created_by_user_id),
+           canonical_stable_id   = coalesce(excluded.canonical_stable_id, study_question.canonical_stable_id),
+           based_on_question_id  = coalesce(excluded.based_on_question_id, study_question.based_on_question_id),
+           moderation_status     = 'published',
+           content_hash          = coalesce(excluded.content_hash, study_question.content_hash),
+           is_local_only         = false,
+           is_community_question = true,
+           submitted_to_community_at = coalesce(study_question.submitted_to_community_at, excluded.submitted_to_community_at),
            updated_at            = now()
          returning id`,
         [
@@ -608,6 +661,10 @@ router.post("/moderation/:id/approve", requireAuth, requireRole("owner", "modera
           question.answer_text ?? "",
           question.truth_statement_text ?? "",
           approvedCloze.value,
+          question.submitter_id ?? req.user.sub,
+          question.canonical_stable_id ?? null,
+          question.based_on_question_id ?? null,
+          question.content_hash ?? normalizedContentHash(question.prompt_text ?? "", question.answer_text ?? "", question.truth_statement_text ?? ""),
         ]
       );
       await query("update study_submission set question_id = $1, updated_at = now() where id = $2", [

@@ -61,8 +61,21 @@ async function runMigrations() {
   await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS truth_statement_text text");
   await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS authored_text text");
   await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS cloze_variants_json jsonb");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS content_hash text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS canonical_stable_id text");
+  await query("ALTER TABLE study_submission ADD COLUMN IF NOT EXISTS based_on_question_id text");
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS created_by_user_id uuid references app_user(id)");
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS canonical_stable_id text");
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS based_on_question_id text");
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS moderation_status text");
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS content_hash text");
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS is_local_only boolean DEFAULT false");
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS is_community_question boolean DEFAULT true");
+  await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS submitted_to_community_at timestamptz");
   await query("CREATE INDEX IF NOT EXISTS idx_submission_question_id ON study_submission(question_id)");
   await query("CREATE INDEX IF NOT EXISTS idx_submission_stable_id ON study_submission(stable_id)");
+  await query("CREATE INDEX IF NOT EXISTS idx_submission_content_hash ON study_submission(content_hash)");
+  await query("CREATE INDEX IF NOT EXISTS idx_question_content_hash ON study_question(content_hash)");
   console.log("Migrations complete.");
 }
 

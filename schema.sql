@@ -22,6 +22,14 @@ create table if not exists study_question (
   status text not null default 'published',
   author_id uuid references app_user(id),
   contributor_id uuid references app_user(id),
+  created_by_user_id uuid references app_user(id),
+  canonical_stable_id text,
+  based_on_question_id text,
+  moderation_status text,
+  content_hash text,
+  is_local_only boolean not null default false,
+  is_community_question boolean not null default true,
+  submitted_to_community_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -43,6 +51,9 @@ create table if not exists study_submission (
   reason text,
   note text,
   proposed_cloze_variants_json jsonb,
+  content_hash text,
+  canonical_stable_id text,
+  based_on_question_id text,
   status text not null default 'pending',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -60,6 +71,8 @@ create table if not exists moderation_event (
 create index if not exists idx_submission_status on study_submission(status);
 create index if not exists idx_submission_question_id on study_submission(question_id);
 create index if not exists idx_submission_stable_id on study_submission(stable_id);
+create index if not exists idx_submission_content_hash on study_submission(content_hash);
+create index if not exists idx_question_content_hash on study_question(content_hash);
 create index if not exists idx_question_status on study_question(status);
 create index if not exists idx_question_updated on study_question(updated_at);
 
