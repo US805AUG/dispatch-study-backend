@@ -248,6 +248,11 @@ router.get("/config", (req, res) => {
     minRequiredVersion: process.env.MIN_REQUIRED_VERSION ?? "1.0.0",
     latestVersion: process.env.LATEST_VERSION ?? "1.0.0",
     appStoreUrl: process.env.APP_STORE_URL ?? "",
+    tvos_update_enforcer_enabled: process.env.TVOS_UPDATE_ENFORCER_ENABLED === "true",
+    tvos_latest_version: process.env.TVOS_LATEST_VERSION ?? "1.0.0",
+    tvos_min_supported_version: process.env.TVOS_MIN_SUPPORTED_VERSION ?? "1.0.0",
+    tvos_latest_build: process.env.TVOS_LATEST_BUILD ?? "1",
+    tvos_min_supported_build: process.env.TVOS_MIN_SUPPORTED_BUILD ?? "1",
   });
 });
 
