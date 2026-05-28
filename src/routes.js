@@ -120,6 +120,19 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function optionalShortText(value, maxLength) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.slice(0, maxLength);
+}
+
+function optionalDate(value) {
+  if (typeof value !== "string") return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
 function isUUID(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
@@ -254,6 +267,48 @@ router.get("/config", (req, res) => {
     tvos_latest_build: process.env.TVOS_LATEST_BUILD ?? "1",
     tvos_min_supported_build: process.env.TVOS_MIN_SUPPORTED_BUILD ?? "1",
   });
+});
+
+router.post("/analytics/events", async (req, res) => {
+  try {
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    if (!name || name.length > 80) {
+      return res.status(400).json({ error: "A valid event name is required." });
+    }
+
+    const platform = optionalShortText(req.body?.platform, 32);
+    const appVersion = optionalShortText(req.body?.appVersion, 32);
+    const buildNumber = optionalShortText(req.body?.buildNumber, 32);
+    const deviceFamily = optionalShortText(req.body?.deviceFamily, 64);
+    const timestamp = optionalDate(req.body?.timestamp);
+
+    const result = await query(
+      `INSERT INTO app_event (
+        id,
+        name,
+        platform,
+        app_version,
+        build_number,
+        device_family,
+        occurred_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()))
+      RETURNING id`,
+      [
+        crypto.randomUUID(),
+        name,
+        platform,
+        appVersion,
+        buildNumber,
+        deviceFamily,
+        timestamp,
+      ]
+    );
+
+    res.status(202).json({ ok: true, id: result.rows[0].id });
+  } catch (error) {
+    console.error("[analytics/events] insert failed", error);
+    res.status(500).json({ error: "Unable to record event." });
+  }
 });
 
 router.post("/auth/apple", async (req, res) => {

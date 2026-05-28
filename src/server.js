@@ -76,6 +76,17 @@ async function runMigrations() {
   await query("CREATE INDEX IF NOT EXISTS idx_submission_stable_id ON study_submission(stable_id)");
   await query("CREATE INDEX IF NOT EXISTS idx_submission_content_hash ON study_submission(content_hash)");
   await query("CREATE INDEX IF NOT EXISTS idx_question_content_hash ON study_question(content_hash)");
+  await query(`CREATE TABLE IF NOT EXISTS app_event (
+    id uuid PRIMARY KEY,
+    name text NOT NULL,
+    platform text,
+    app_version text,
+    build_number text,
+    device_family text,
+    occurred_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await query("CREATE INDEX IF NOT EXISTS idx_app_event_name_created ON app_event(name, created_at)");
   console.log("Migrations complete.");
 }
 

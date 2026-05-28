@@ -68,6 +68,17 @@ create table if not exists moderation_event (
   created_at timestamptz not null default now()
 );
 
+create table if not exists app_event (
+  id uuid primary key,
+  name text not null,
+  platform text,
+  app_version text,
+  build_number text,
+  device_family text,
+  occurred_at timestamptz not null default now(),
+  created_at timestamptz not null default now()
+);
+
 create index if not exists idx_submission_status on study_submission(status);
 create index if not exists idx_submission_question_id on study_submission(question_id);
 create index if not exists idx_submission_stable_id on study_submission(stable_id);
@@ -75,6 +86,7 @@ create index if not exists idx_submission_content_hash on study_submission(conte
 create index if not exists idx_question_content_hash on study_question(content_hash);
 create index if not exists idx_question_status on study_question(status);
 create index if not exists idx_question_updated on study_question(updated_at);
+create index if not exists idx_app_event_name_created on app_event(name, created_at);
 
 -- Migration: run once in Railway SQL editor if the table already exists
 -- alter table study_question add column if not exists source_origin text default '';
