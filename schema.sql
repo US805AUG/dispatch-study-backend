@@ -70,11 +70,21 @@ create table if not exists moderation_event (
 
 create table if not exists app_event (
   id uuid primary key,
+  install_id text,
   name text not null,
   platform text,
   app_version text,
   build_number text,
   device_family text,
+  os_version text,
+  locale text,
+  locale_region text,
+  time_zone text,
+  properties jsonb not null default '{}'::jsonb,
+  country text,
+  region text,
+  city text,
+  likely_school_region text not null default 'Unknown',
   occurred_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
@@ -87,8 +97,11 @@ create index if not exists idx_question_content_hash on study_question(content_h
 create index if not exists idx_question_status on study_question(status);
 create index if not exists idx_question_updated on study_question(updated_at);
 create index if not exists idx_app_event_name_created on app_event(name, created_at);
+create index if not exists idx_app_event_install_created on app_event(install_id, created_at);
+create index if not exists idx_app_event_likely_region on app_event(likely_school_region);
 
 -- Migration: run once in Railway SQL editor if the table already exists
 -- alter table study_question add column if not exists source_origin text default '';
 -- alter table study_submission drop constraint if exists study_submission_question_id_fkey;
 -- alter table study_submission alter column question_id drop not null;
+-- update study_question set canonical_stable_id = stable_id where status in ('published', 'approved') and (canonical_stable_id is null or btrim(canonical_stable_id) = '');

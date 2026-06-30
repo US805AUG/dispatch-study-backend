@@ -72,21 +72,49 @@ async function runMigrations() {
   await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS is_local_only boolean DEFAULT false");
   await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS is_community_question boolean DEFAULT true");
   await query("ALTER TABLE study_question ADD COLUMN IF NOT EXISTS submitted_to_community_at timestamptz");
+  await query(`
+    UPDATE study_question
+    SET canonical_stable_id = stable_id
+    WHERE status in ('published', 'approved')
+      AND (canonical_stable_id IS NULL OR btrim(canonical_stable_id) = '')
+  `);
   await query("CREATE INDEX IF NOT EXISTS idx_submission_question_id ON study_submission(question_id)");
   await query("CREATE INDEX IF NOT EXISTS idx_submission_stable_id ON study_submission(stable_id)");
   await query("CREATE INDEX IF NOT EXISTS idx_submission_content_hash ON study_submission(content_hash)");
   await query("CREATE INDEX IF NOT EXISTS idx_question_content_hash ON study_question(content_hash)");
   await query(`CREATE TABLE IF NOT EXISTS app_event (
     id uuid PRIMARY KEY,
+    install_id text,
     name text NOT NULL,
     platform text,
     app_version text,
     build_number text,
     device_family text,
+    os_version text,
+    locale text,
+    locale_region text,
+    time_zone text,
+    properties jsonb NOT NULL DEFAULT '{}'::jsonb,
+    country text,
+    region text,
+    city text,
+    likely_school_region text NOT NULL DEFAULT 'Unknown',
     occurred_at timestamptz NOT NULL DEFAULT now(),
     created_at timestamptz NOT NULL DEFAULT now()
   )`);
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS install_id text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS os_version text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS locale text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS locale_region text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS time_zone text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS properties jsonb NOT NULL DEFAULT '{}'::jsonb");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS country text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS region text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS city text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS likely_school_region text NOT NULL DEFAULT 'Unknown'");
   await query("CREATE INDEX IF NOT EXISTS idx_app_event_name_created ON app_event(name, created_at)");
+  await query("CREATE INDEX IF NOT EXISTS idx_app_event_install_created ON app_event(install_id, created_at)");
+  await query("CREATE INDEX IF NOT EXISTS idx_app_event_likely_region ON app_event(likely_school_region)");
   console.log("Migrations complete.");
 }
 

@@ -133,6 +133,65 @@ function optionalDate(value) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+function optionalJSONObject(value, maxKeys = 40) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return {};
+  const blockedKeys = new Set([
+    "answer",
+    "answerText",
+    "authoredText",
+    "cardText",
+    "email",
+    "fullName",
+    "name",
+    "phone",
+    "prompt",
+    "promptText",
+    "question",
+    "questionText",
+    "rawText",
+    "searchText",
+    "text",
+    "truthStatementText",
+  ]);
+  const out = {};
+  for (const [key, rawValue] of Object.entries(value).slice(0, maxKeys)) {
+    if (blockedKeys.has(key)) continue;
+    if (typeof rawValue === "string") {
+      out[key] = rawValue.slice(0, 160);
+    } else if (typeof rawValue === "number" || typeof rawValue === "boolean") {
+      out[key] = rawValue;
+    }
+  }
+  return out;
+}
+
+function coarseRegionFromRequest(req, event) {
+  const header = (name) => optionalShortText(req.headers[name], 80);
+  const localeRegion = optionalShortText(event?.localeRegion, 16);
+  return {
+    country: header("cf-ipcountry") ?? header("x-vercel-ip-country") ?? localeRegion ?? null,
+    region: header("x-vercel-ip-country-region") ?? header("x-railway-region") ?? null,
+    city: header("x-vercel-ip-city") ?? null,
+  };
+}
+
+function likelySchoolRegion({ country, region, city, timeZone, localeRegion }) {
+  const parts = [country, region, city, timeZone, localeRegion]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  if (parts.includes("utah") || parts.includes("america/denver") || parts.includes("st. george") || parts.includes("saint george")) {
+    return "Possible ADA / Utah";
+  }
+  if (parts.includes("texas") || parts.includes("dfw") || parts.includes("dallas") || parts.includes("fort worth") || parts.includes("america/chicago")) {
+    return "Possible IFOD / DFW school cluster";
+  }
+  if (parts.includes("florida") || parts.includes("miami") || parts.includes("fort lauderdale") || parts.includes("america/new_york")) {
+    return "Possible Sheffield / Florida";
+  }
+  return "Unknown";
+}
+
 function isUUID(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
@@ -271,43 +330,220 @@ router.get("/config", (req, res) => {
 
 router.post("/analytics/events", async (req, res) => {
   try {
-    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
-    if (!name || name.length > 80) {
-      return res.status(400).json({ error: "A valid event name is required." });
+    const contentLength = Number(req.headers["content-length"] ?? 0);
+    if (contentLength > 128 * 1024) {
+      return res.status(413).json({ error: "Analytics payload too large." });
     }
 
-    const platform = optionalShortText(req.body?.platform, 32);
-    const appVersion = optionalShortText(req.body?.appVersion, 32);
-    const buildNumber = optionalShortText(req.body?.buildNumber, 32);
-    const deviceFamily = optionalShortText(req.body?.deviceFamily, 64);
-    const timestamp = optionalDate(req.body?.timestamp);
+    const installId = optionalShortText(req.body?.installId, 80) ?? optionalShortText(req.body?.anonymousInstallID, 80) ?? "legacy";
+    const events = Array.isArray(req.body?.events)
+      ? req.body.events
+      : isNonEmptyString(req.body?.name)
+        ? [{
+            eventName: req.body.name,
+            timestamp: req.body.timestamp,
+            appVersion: req.body.appVersion,
+            buildNumber: req.body.buildNumber,
+            platform: req.body.platform,
+            deviceFamily: req.body.deviceFamily,
+            properties: req.body.properties,
+          }]
+        : null;
+    if (!installId || !events || events.length === 0 || events.length > 50) {
+      return res.status(400).json({ error: "installId and 1-50 events are required." });
+    }
 
-    const result = await query(
-      `INSERT INTO app_event (
-        id,
-        name,
-        platform,
-        app_version,
-        build_number,
-        device_family,
-        occurred_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()))
-      RETURNING id`,
-      [
-        crypto.randomUUID(),
-        name,
-        platform,
-        appVersion,
-        buildNumber,
-        deviceFamily,
-        timestamp,
-      ]
-    );
+    const insertedIds = [];
+    for (const event of events) {
+      const name = typeof event?.eventName === "string" ? event.eventName.trim() : "";
+      if (!name || name.length > 80) {
+        return res.status(400).json({ error: "Each event needs a valid eventName." });
+      }
 
-    res.status(202).json({ ok: true, id: result.rows[0].id });
+      const platform = optionalShortText(event?.platform, 32);
+      const appVersion = optionalShortText(event?.appVersion, 32);
+      const buildNumber = optionalShortText(event?.buildNumber, 32);
+      const deviceFamily = optionalShortText(event?.deviceFamily, 64);
+      const osVersion = optionalShortText(event?.osVersion, 32);
+      const locale = optionalShortText(event?.locale, 64);
+      const localeRegion = optionalShortText(event?.localeRegion, 16);
+      const timeZone = optionalShortText(event?.timeZone, 80);
+      const timestamp = optionalDate(event?.timestamp);
+      const properties = optionalJSONObject(event?.properties);
+      const coarseRegion = coarseRegionFromRequest(req, { localeRegion });
+      const schoolRegion = likelySchoolRegion({
+        ...coarseRegion,
+        timeZone,
+        localeRegion,
+      });
+
+      const result = await query(
+        `INSERT INTO app_event (
+          id,
+          install_id,
+          name,
+          platform,
+          app_version,
+          build_number,
+          device_family,
+          os_version,
+          locale,
+          locale_region,
+          time_zone,
+          properties,
+          country,
+          region,
+          city,
+          likely_school_region,
+          occurred_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,COALESCE($17::timestamptz, now()))
+        RETURNING id`,
+        [
+          crypto.randomUUID(),
+          installId,
+          name,
+          platform,
+          appVersion,
+          buildNumber,
+          deviceFamily,
+          osVersion,
+          locale,
+          localeRegion,
+          timeZone,
+          JSON.stringify(properties),
+          coarseRegion.country,
+          coarseRegion.region,
+          coarseRegion.city,
+          schoolRegion,
+          timestamp,
+        ]
+      );
+      insertedIds.push(result.rows[0].id);
+    }
+
+    res.status(202).json({ ok: true, inserted: insertedIds.length, ids: insertedIds });
   } catch (error) {
     console.error("[analytics/events] insert failed", error);
     res.status(500).json({ error: "Unable to record event." });
+  }
+});
+
+router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"), async (req, res) => {
+  try {
+    const [
+      installs,
+      activeInstalls,
+      sessions,
+      eventCounts,
+      topViewed,
+      topMissed,
+      topGotIt,
+      regionCounts,
+      schoolRegionCounts,
+    ] = await Promise.all([
+      query("select count(distinct install_id) as total from app_event where install_id is not null"),
+      query(`
+        select
+          count(distinct install_id) filter (where occurred_at >= now() - interval '1 day') as d1,
+          count(distinct install_id) filter (where occurred_at >= now() - interval '7 days') as d7,
+          count(distinct install_id) filter (where occurred_at >= now() - interval '30 days') as d30
+        from app_event
+        where install_id is not null
+      `),
+      query(`
+        select
+          count(*) filter (where occurred_at >= now() - interval '1 day') as d1,
+          count(*) filter (where occurred_at >= now() - interval '7 days') as d7,
+          count(*) filter (where occurred_at >= now() - interval '30 days') as d30
+        from app_event
+        where name = 'session_start'
+      `),
+      query(`
+        select name, count(*)::int as count
+        from app_event
+        where name in (
+          'study_session_started',
+          'library_opened',
+          'private_card_created',
+          'private_card_shared_completed'
+        )
+        group by name
+      `),
+      query(`
+        select properties->>'canonicalQuestionID' as canonical_question_id, count(*)::int as count
+        from app_event
+        where name in ('canonical_question_seen', 'study_card_presented', 'library_question_opened')
+          and properties ? 'canonicalQuestionID'
+        group by canonical_question_id
+        order by count desc
+        limit 25
+      `),
+      query(`
+        select properties->>'canonicalQuestionID' as canonical_question_id, count(*)::int as count
+        from app_event
+        where name = 'study_card_marked_missed'
+          and properties ? 'canonicalQuestionID'
+        group by canonical_question_id
+        order by count desc
+        limit 25
+      `),
+      query(`
+        select properties->>'canonicalQuestionID' as canonical_question_id, count(*)::int as count
+        from app_event
+        where name = 'study_card_marked_got_it'
+          and properties ? 'canonicalQuestionID'
+        group by canonical_question_id
+        order by count desc
+        limit 25
+      `),
+      query(`
+        select coalesce(country, 'Unknown') as country,
+               coalesce(region, 'Unknown') as region,
+               coalesce(time_zone, 'Unknown') as time_zone,
+               count(*)::int as count
+        from app_event
+        group by country, region, time_zone
+        order by count desc
+        limit 50
+      `),
+      query(`
+        select likely_school_region, count(distinct install_id)::int as installs, count(*)::int as events
+        from app_event
+        group by likely_school_region
+        order by events desc
+      `),
+    ]);
+
+    const counts = Object.fromEntries(eventCounts.rows.map((row) => [row.name, Number(row.count)]));
+    const studyActivity = counts.study_session_started ?? 0;
+    const libraryOpens = counts.library_opened ?? 0;
+    res.json({
+      totalAnonymousInstalls: Number(installs.rows[0]?.total ?? 0),
+      activeInstalls: {
+        last1Day: Number(activeInstalls.rows[0]?.d1 ?? 0),
+        last7Days: Number(activeInstalls.rows[0]?.d7 ?? 0),
+        last30Days: Number(activeInstalls.rows[0]?.d30 ?? 0),
+      },
+      sessions: {
+        last1Day: Number(sessions.rows[0]?.d1 ?? 0),
+        last7Days: Number(sessions.rows[0]?.d7 ?? 0),
+        last30Days: Number(sessions.rows[0]?.d30 ?? 0),
+      },
+      studySessions: studyActivity,
+      libraryOpens,
+      studyToLibraryRatio: libraryOpens === 0 ? null : Number((studyActivity / libraryOpens).toFixed(2)),
+      privateCardsCreated: counts.private_card_created ?? 0,
+      privateCardsShared: counts.private_card_shared_completed ?? 0,
+      topCanonicalQuestionsByViews: topViewed.rows,
+      topCanonicalQuestionsByMissedCount: topMissed.rows,
+      topCanonicalQuestionsByGotItCount: topGotIt.rows,
+      usageByCoarseRegion: regionCounts.rows,
+      likelySchoolRegionAggregates: schoolRegionCounts.rows,
+      inferenceNotice: "likelySchoolRegion is an aggregate inference only. It is not user-visible and must not affect app behavior.",
+    });
+  } catch (err) {
+    console.error("[admin/analytics/summary]", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
