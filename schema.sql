@@ -84,6 +84,7 @@ create table if not exists app_event (
   country text,
   region text,
   city text,
+  geolocation_source text,
   likely_school_region text not null default 'Unknown',
   occurred_at timestamptz not null default now(),
   created_at timestamptz not null default now()
