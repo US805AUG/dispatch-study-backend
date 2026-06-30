@@ -440,6 +440,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       studyBehavior,
       platformBreakdown,
       appVersionBreakdown,
+      installDiagnostics,
       mostStudiedPacks,
       leastStudiedPacks,
       topViewedQuestions,
@@ -447,6 +448,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       lowestCorrectRateQuestions,
       abandonedBeforeReveal,
       repeatedlyMissedQuestions,
+      canonicalQuestionAnalytics,
       coarseGeography,
       recentStudyActivity,
       reliabilityFailures,
@@ -529,6 +531,19 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         select
           count(*) filter (where name = 'study_session_started')::int as study_sessions_started,
           count(*) filter (where name = 'study_session_completed')::int as study_sessions_completed,
+          count(*) filter (
+            where name = 'study_session_started'
+              and occurred_at < now() - interval '30 minutes'
+              and not exists (
+                select 1
+                from app_event completed
+                where completed.name = 'study_session_completed'
+                  and completed.install_id = app_event.install_id
+                  and coalesce(completed.properties->>'anonymous_session_id', '') = coalesce(app_event.properties->>'anonymous_session_id', '')
+                  and completed.occurred_at >= app_event.occurred_at
+                  and completed.occurred_at <= app_event.occurred_at + interval '6 hours'
+              )
+          )::int as study_sessions_abandoned,
           count(*) filter (where name = 'question_viewed')::int as questions_viewed,
           count(*) filter (where name = 'answer_revealed')::int as answers_revealed,
           count(*) filter (where name = 'answer_marked_correct')::int as correct_answers,
@@ -563,6 +578,30 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         limit 20
       `),
       query(`
+        select
+          case
+            when install_id is null then 'unknown'
+            when length(install_id) <= 12 then install_id
+            else left(install_id, 8) || '...' || right(install_id, 4)
+          end as install_label,
+          coalesce(max(platform) filter (where platform is not null), 'Unknown') as platform,
+          coalesce(max(device_family) filter (where device_family is not null), 'Unknown') as device_family,
+          coalesce(max(app_version) filter (where app_version is not null), 'Unknown') as app_version,
+          coalesce(max(build_number) filter (where build_number is not null), 'Unknown') as build_number,
+          coalesce(max(locale) filter (where locale is not null), 'Unknown') as locale,
+          coalesce(max(time_zone) filter (where time_zone is not null), 'Unknown') as time_zone,
+          coalesce(max(country) filter (where country is not null), 'Unknown') as country,
+          coalesce(max(region) filter (where region is not null), 'Unknown') as region,
+          min(occurred_at) as first_event_at,
+          max(occurred_at) as last_event_at,
+          count(*)::int as events
+        from app_event
+        where install_id is not null
+        group by install_id
+        order by last_event_at desc
+        limit 100
+      `),
+      query(`
         select properties->>'pack_id' as pack_id, count(*)::int as count
         from app_event
         where name = 'question_viewed'
@@ -581,32 +620,61 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         limit 25
       `),
       query(`
-        select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
-               count(*)::int as views,
-               max(properties->>'pack_id') as pack_id,
-               max(properties->>'topic') as topic,
-               max(properties->>'source') as source
-        from app_event
-        where name = 'question_viewed'
-          and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
-          and coalesce(properties->>'is_private', 'false') <> 'true'
-        group by question_id
-        order by views desc
+        with question_events as (
+          select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+                 count(*)::int as views,
+                 max(properties->>'pack_id') as event_pack_id,
+                 max(properties->>'topic') as event_topic,
+                 max(properties->>'source') as event_source
+          from app_event
+          where name = 'question_viewed'
+            and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+            and coalesce(properties->>'is_private', 'false') <> 'true'
+          group by question_id
+        )
+        select question_events.question_id,
+               coalesce(nullif(left(coalesce(nullif(study_question.truth_statement_text, ''), study_question.prompt_text), 120), ''), question_events.question_id) as question_text,
+               coalesce(study_question.content_pack_id, question_events.event_pack_id) as pack_id,
+               coalesce(study_question.topic, question_events.event_topic) as topic,
+               coalesce(study_question.source_origin, question_events.event_source) as source,
+               study_question.status,
+               question_events.views
+        from question_events
+        left join study_question
+          on study_question.stable_id = question_events.question_id
+          or study_question.canonical_stable_id = question_events.question_id
+          or study_question.id::text = question_events.question_id
+        order by question_events.views desc
         limit 25
       `),
       query(`
-        select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
-               count(*)::int as missed,
-               count(distinct install_id)::int as installs,
-               max(properties->>'pack_id') as pack_id,
-               max(properties->>'topic') as topic,
-               max(properties->>'source') as source
-        from app_event
-        where name in ('answer_marked_incorrect', 'study_card_marked_missed')
-          and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
-          and coalesce(properties->>'is_private', 'false') <> 'true'
-        group by question_id
-        order by missed desc
+        with question_events as (
+          select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+                 count(*)::int as missed,
+                 count(distinct install_id)::int as installs,
+                 max(properties->>'pack_id') as event_pack_id,
+                 max(properties->>'topic') as event_topic,
+                 max(properties->>'source') as event_source
+          from app_event
+          where name in ('answer_marked_incorrect', 'study_card_marked_missed')
+            and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+            and coalesce(properties->>'is_private', 'false') <> 'true'
+          group by question_id
+        )
+        select question_events.question_id,
+               coalesce(nullif(left(coalesce(nullif(study_question.truth_statement_text, ''), study_question.prompt_text), 120), ''), question_events.question_id) as question_text,
+               coalesce(study_question.content_pack_id, question_events.event_pack_id) as pack_id,
+               coalesce(study_question.topic, question_events.event_topic) as topic,
+               coalesce(study_question.source_origin, question_events.event_source) as source,
+               study_question.status,
+               question_events.missed,
+               question_events.installs
+        from question_events
+        left join study_question
+          on study_question.stable_id = question_events.question_id
+          or study_question.canonical_stable_id = question_events.question_id
+          or study_question.id::text = question_events.question_id
+        order by question_events.missed desc
         limit 25
       `),
       query(`
@@ -624,17 +692,23 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
             and coalesce(properties->>'is_private', 'false') <> 'true'
           group by question_id
         )
-        select question_id,
-               correct,
-               incorrect,
-               rated,
-               round((correct::numeric / nullif(rated, 0)) * 100, 1)::float as correct_rate,
-               pack_id,
-               topic,
-               source
+        select rated.question_id,
+               coalesce(nullif(left(coalesce(nullif(study_question.truth_statement_text, ''), study_question.prompt_text), 120), ''), rated.question_id) as question_text,
+               rated.correct,
+               rated.incorrect,
+               rated.rated,
+               round((rated.correct::numeric / nullif(rated.rated, 0)) * 100, 1)::float as correct_rate,
+               coalesce(study_question.content_pack_id, rated.pack_id) as pack_id,
+               coalesce(study_question.topic, rated.topic) as topic,
+               coalesce(study_question.source_origin, rated.source) as source,
+               study_question.status
         from rated
-        where rated > 0
-        order by correct_rate asc, rated desc
+        left join study_question
+          on study_question.stable_id = rated.question_id
+          or study_question.canonical_stable_id = rated.question_id
+          or study_question.id::text = rated.question_id
+        where rated.rated > 0
+        order by correct_rate asc, rated.rated desc
         limit 25
       `),
       query(`
@@ -650,43 +724,151 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
             and coalesce(properties->>'is_private', 'false') <> 'true'
           group by question_id
         ),
-        revealed as (
+        reveal_or_answer as (
           select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
-                 count(*)::int as reveals
+                 count(*)::int as reveal_or_answer_count
           from app_event
-          where name = 'answer_revealed'
+          where name in ('answer_revealed', 'answer_marked_correct', 'answer_marked_incorrect')
             and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
             and coalesce(properties->>'is_private', 'false') <> 'true'
           group by question_id
+        ),
+        abandoned_views as (
+          select coalesce(viewed_event.properties->>'question_id', viewed_event.properties->>'canonicalQuestionID') as question_id,
+                 count(*)::int as abandoned_before_reveal
+          from app_event viewed_event
+          where viewed_event.name = 'question_viewed'
+            and viewed_event.occurred_at < now() - interval '30 minutes'
+            and coalesce(viewed_event.properties->>'question_id', viewed_event.properties->>'canonicalQuestionID') is not null
+            and coalesce(viewed_event.properties->>'is_private', 'false') <> 'true'
+            and not exists (
+              select 1
+              from app_event next_event
+              where next_event.install_id = viewed_event.install_id
+                and coalesce(next_event.properties->>'anonymous_session_id', '') = coalesce(viewed_event.properties->>'anonymous_session_id', '')
+                and coalesce(next_event.properties->>'question_id', next_event.properties->>'canonicalQuestionID') = coalesce(viewed_event.properties->>'question_id', viewed_event.properties->>'canonicalQuestionID')
+                and next_event.name in ('answer_revealed', 'answer_marked_correct', 'answer_marked_incorrect')
+                and next_event.occurred_at >= viewed_event.occurred_at
+                and next_event.occurred_at <= viewed_event.occurred_at + interval '30 minutes'
+            )
+          group by question_id
         )
         select viewed.question_id,
+               coalesce(nullif(left(coalesce(nullif(study_question.truth_statement_text, ''), study_question.prompt_text), 120), ''), viewed.question_id) as question_text,
                viewed.views,
-               coalesce(revealed.reveals, 0)::int as reveals,
-               (viewed.views - coalesce(revealed.reveals, 0))::int as abandoned_before_reveal,
-               viewed.pack_id,
-               viewed.topic,
-               viewed.source
+               coalesce(reveal_or_answer.reveal_or_answer_count, 0)::int as reveal_or_answer_count,
+               abandoned_views.abandoned_before_reveal,
+               coalesce(study_question.content_pack_id, viewed.pack_id) as pack_id,
+               coalesce(study_question.topic, viewed.topic) as topic,
+               coalesce(study_question.source_origin, viewed.source) as source,
+               study_question.status
         from viewed
-        left join revealed on revealed.question_id = viewed.question_id
-        where viewed.views > coalesce(revealed.reveals, 0)
-        order by abandoned_before_reveal desc, viewed.views desc
+        join abandoned_views on abandoned_views.question_id = viewed.question_id
+        left join reveal_or_answer on reveal_or_answer.question_id = viewed.question_id
+        left join study_question
+          on study_question.stable_id = viewed.question_id
+          or study_question.canonical_stable_id = viewed.question_id
+          or study_question.id::text = viewed.question_id
+        order by abandoned_views.abandoned_before_reveal desc, viewed.views desc
         limit 25
       `),
       query(`
-        select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
-               count(*)::int as missed,
-               count(distinct install_id)::int as installs,
-               max(properties->>'pack_id') as pack_id,
-               max(properties->>'topic') as topic,
-               max(properties->>'source') as source
-        from app_event
-        where name in ('answer_marked_incorrect', 'study_card_marked_missed')
-          and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
-          and coalesce(properties->>'is_private', 'false') <> 'true'
-        group by question_id
-        having count(*) >= 2
-        order by missed desc, installs desc
+        with question_events as (
+          select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+                 count(*)::int as missed,
+                 count(distinct install_id)::int as installs,
+                 max(properties->>'pack_id') as event_pack_id,
+                 max(properties->>'topic') as event_topic,
+                 max(properties->>'source') as event_source
+          from app_event
+          where name in ('answer_marked_incorrect', 'study_card_marked_missed')
+            and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+            and coalesce(properties->>'is_private', 'false') <> 'true'
+          group by question_id
+          having count(*) >= 2
+        )
+        select question_events.question_id,
+               coalesce(nullif(left(coalesce(nullif(study_question.truth_statement_text, ''), study_question.prompt_text), 120), ''), question_events.question_id) as question_text,
+               coalesce(study_question.content_pack_id, question_events.event_pack_id) as pack_id,
+               coalesce(study_question.topic, question_events.event_topic) as topic,
+               coalesce(study_question.source_origin, question_events.event_source) as source,
+               study_question.status,
+               question_events.missed,
+               question_events.installs
+        from question_events
+        left join study_question
+          on study_question.stable_id = question_events.question_id
+          or study_question.canonical_stable_id = question_events.question_id
+          or study_question.id::text = question_events.question_id
+        order by question_events.missed desc, question_events.installs desc
         limit 25
+      `),
+      query(`
+        with canonical_questions as (
+          select stable_id as question_id,
+                 left(coalesce(nullif(truth_statement_text, ''), prompt_text), 120) as question_text,
+                 content_pack_id as pack_id,
+                 topic,
+                 source_origin as source,
+                 status
+          from study_question
+          where status in ('published', 'approved')
+        ),
+        resolved_events as (
+          select coalesce(study_question.stable_id, coalesce(app_event.properties->>'question_id', app_event.properties->>'canonicalQuestionID')) as question_id,
+                 app_event.install_id,
+                 app_event.name
+          from app_event
+          left join study_question
+            on study_question.stable_id = coalesce(app_event.properties->>'question_id', app_event.properties->>'canonicalQuestionID')
+            or study_question.canonical_stable_id = coalesce(app_event.properties->>'question_id', app_event.properties->>'canonicalQuestionID')
+            or study_question.id::text = coalesce(app_event.properties->>'question_id', app_event.properties->>'canonicalQuestionID')
+          where app_event.name in ('question_viewed', 'answer_revealed', 'answer_marked_correct', 'answer_marked_incorrect')
+            and coalesce(app_event.properties->>'question_id', app_event.properties->>'canonicalQuestionID') is not null
+            and coalesce(app_event.properties->>'is_private', 'false') <> 'true'
+        ),
+        stats as (
+          select question_id,
+                 count(*) filter (where name = 'question_viewed')::int as views,
+                 count(*) filter (where name = 'answer_revealed')::int as reveals,
+                 count(*) filter (where name = 'answer_marked_correct')::int as correct,
+                 count(*) filter (where name = 'answer_marked_incorrect')::int as incorrect,
+                 count(*) filter (where name in ('answer_marked_correct', 'answer_marked_incorrect'))::int as rated,
+                 count(distinct install_id) filter (where name in ('answer_marked_correct', 'answer_marked_incorrect'))::int as rated_installs
+          from resolved_events
+          group by question_id
+        ),
+        repeat_misses as (
+          select question_id, count(*)::int as repeat_miss_installs
+          from (
+            select question_id, install_id, count(*)::int as misses
+            from resolved_events
+            where name = 'answer_marked_incorrect'
+              and install_id is not null
+            group by question_id, install_id
+            having count(*) >= 2
+          ) repeated
+          group by question_id
+        )
+        select canonical_questions.question_id,
+               canonical_questions.question_text,
+               canonical_questions.pack_id,
+               canonical_questions.topic,
+               canonical_questions.source,
+               canonical_questions.status,
+               coalesce(stats.views, 0)::int as views,
+               coalesce(stats.reveals, 0)::int as reveals,
+               coalesce(stats.correct, 0)::int as correct,
+               coalesce(stats.incorrect, 0)::int as incorrect,
+               round((coalesce(stats.reveals, 0)::numeric / nullif(stats.views, 0)) * 100, 1)::float as reveal_rate,
+               round((coalesce(stats.correct, 0)::numeric / nullif(stats.rated, 0)) * 100, 1)::float as correct_rate,
+               round((coalesce(stats.incorrect, 0)::numeric / nullif(stats.rated, 0)) * 100, 1)::float as incorrect_rate,
+               round((coalesce(stats.rated, 0)::numeric / nullif(stats.rated_installs, 0)), 2)::float as average_attempts,
+               coalesce(repeat_misses.repeat_miss_installs, 0)::int as repeat_miss_installs
+        from canonical_questions
+        left join stats on stats.question_id = canonical_questions.question_id
+        left join repeat_misses on repeat_misses.question_id = canonical_questions.question_id
+        order by coalesce(stats.views, 0) desc, canonical_questions.question_id asc
       `),
       query(`
         select coalesce(country, 'Unknown') as country,
@@ -706,12 +888,21 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       query(`
         select occurred_at,
                coalesce(platform, device_family, 'Unknown') as platform,
+               coalesce(app_version, 'Unknown') as app_version,
+               coalesce(build_number, 'Unknown') as build_number,
                name,
                coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+               coalesce(nullif(left(coalesce(nullif(study_question.truth_statement_text, ''), study_question.prompt_text), 120), ''), coalesce(properties->>'question_id', properties->>'canonicalQuestionID')) as question_text,
                properties->>'result' as result,
-               properties->>'source' as source,
-               properties->>'topic' as topic
+               coalesce(study_question.source_origin, properties->>'source') as source,
+               coalesce(study_question.topic, properties->>'topic') as topic,
+               coalesce(study_question.content_pack_id, properties->>'pack_id') as pack_id,
+               study_question.status
         from app_event
+        left join study_question
+          on study_question.stable_id = coalesce(properties->>'question_id', properties->>'canonicalQuestionID')
+          or study_question.canonical_stable_id = coalesce(properties->>'question_id', properties->>'canonicalQuestionID')
+          or study_question.id::text = coalesce(properties->>'question_id', properties->>'canonicalQuestionID')
         where name in (
           'question_viewed',
           'answer_revealed',
@@ -747,6 +938,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
     const incorrectAnswers = Number(study.incorrect_answers ?? 0);
     const totalRatedAnswers = correctAnswers + incorrectAnswers;
     const unansweredOrUnrated = Math.max(questionsViewed - totalRatedAnswers, 0);
+    const studySessionsAbandoned = Number(study.study_sessions_abandoned ?? 0);
     const libraryOpens = Number(study.library_opens ?? 0);
     const lifecycleRow = lifecycle.rows[0] ?? {};
     const appSessionsRow = appSessions.rows[0] ?? {};
@@ -783,8 +975,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       study: {
         sessionsStarted: studySessionsStarted,
         sessionsCompleted: studySessionsCompleted,
-        sessionsAbandoned: Math.max(studySessionsStarted - studySessionsCompleted, 0),
-        sessionAbandonmentRate: percent(Math.max(studySessionsStarted - studySessionsCompleted, 0), studySessionsStarted),
+        sessionsAbandoned: studySessionsAbandoned,
+        sessionAbandonmentRate: percent(studySessionsAbandoned, studySessionsStarted),
         averageSessionDurationMs: study.avg_session_duration_ms == null ? null : Number(study.avg_session_duration_ms),
         averageQuestionsPerCompletedSession: study.avg_questions_per_completed_session == null ? null : Number(study.avg_questions_per_completed_session),
         averageStudySessionsPerDay: Number((studySessionsStarted / 30).toFixed(2)),
@@ -807,6 +999,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         lowestCorrectRateQuestions: lowestCorrectRateQuestions.rows,
         questionsAbandonedBeforeReveal: abandonedBeforeReveal.rows,
         questionsRepeatedlyMissed: repeatedlyMissedQuestions.rows,
+        canonicalQuestionAnalytics: canonicalQuestionAnalytics.rows,
       },
       communityFunnel: {
         contributionPageOpened: funnelCount("contribution_flow_opened"),
@@ -834,6 +1027,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       },
       platformBreakdown: platformBreakdown.rows,
       appVersionBreakdown: appVersionBreakdown.rows,
+      installDiagnostics: installDiagnostics.rows,
       coarseGeography: coarseGeography.rows,
       recentStudyActivity: recentStudyActivity.rows,
       reliabilityFailures: reliabilityFailures.rows,
@@ -841,7 +1035,9 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       auditNotes: [
         "App sessions are counted from app_launch events. The previous summary queried session_start, which the app does not emit.",
         "Canonical question tables now read question_id as emitted by the app, with canonicalQuestionID retained as a legacy fallback.",
-        "Library opens require library_opened events. Older builds only emitted question_viewed with view_context=library.",
+        "Session abandonment counts study_session_started events older than 30 minutes with no study_session_completed event for the same anonymous install/session within 6 hours.",
+        "Abandoned before reveal counts question_viewed events older than 30 minutes with no later reveal or rating for the same anonymous install/session/question within 30 minutes.",
+        "Country/region are server-side coarse request metadata. Time zone and locale are client-provided app fields.",
       ],
     });
   } catch (err) {
