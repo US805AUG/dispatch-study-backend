@@ -434,115 +434,341 @@ router.post("/analytics/events", async (req, res) => {
 router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"), async (req, res) => {
   try {
     const [
-      installs,
-      activeInstalls,
-      sessions,
+      lifecycle,
+      appSessions,
       eventCounts,
-      topViewed,
-      topMissed,
-      topGotIt,
-      regionCounts,
-      schoolRegionCounts,
+      studyBehavior,
+      platformBreakdown,
+      appVersionBreakdown,
+      mostStudiedPacks,
+      leastStudiedPacks,
+      topViewedQuestions,
+      mostMissedQuestions,
+      abandonedBeforeReveal,
+      repeatedlyMissedQuestions,
+      reliabilityFailures,
     ] = await Promise.all([
-      query("select count(distinct install_id) as total from app_event where install_id is not null"),
       query(`
+        with first_seen as (
+          select install_id, min(occurred_at) as first_seen_at
+          from app_event
+          where install_id is not null
+          group by install_id
+        )
         select
-          count(distinct install_id) filter (where occurred_at >= now() - interval '1 day') as d1,
-          count(distinct install_id) filter (where occurred_at >= now() - interval '7 days') as d7,
-          count(distinct install_id) filter (where occurred_at >= now() - interval '30 days') as d30
-        from app_event
-        where install_id is not null
+          (select count(*) from app_event)::int as total_events,
+          count(*)::int as total_anonymous_installs,
+          count(*) filter (where first_seen_at >= now() - interval '1 day')::int as new_1d,
+          count(*) filter (where first_seen_at >= now() - interval '7 days')::int as new_7d,
+          count(*) filter (where first_seen_at >= now() - interval '30 days')::int as new_30d,
+          count(*) filter (
+            where exists (
+              select 1 from app_event e
+              where e.install_id = first_seen.install_id
+                and e.occurred_at >= now() - interval '1 day'
+            )
+          )::int as active_1d,
+          count(*) filter (
+            where exists (
+              select 1 from app_event e
+              where e.install_id = first_seen.install_id
+                and e.occurred_at >= now() - interval '7 days'
+            )
+          )::int as active_7d,
+          count(*) filter (
+            where exists (
+              select 1 from app_event e
+              where e.install_id = first_seen.install_id
+                and e.occurred_at >= now() - interval '30 days'
+            )
+          )::int as active_30d,
+          count(*) filter (
+            where first_seen_at < now() - interval '1 day'
+              and exists (
+                select 1 from app_event e
+                where e.install_id = first_seen.install_id
+                  and e.occurred_at >= now() - interval '1 day'
+              )
+          )::int as returning_1d,
+          count(*) filter (
+            where first_seen_at < now() - interval '7 days'
+              and exists (
+                select 1 from app_event e
+                where e.install_id = first_seen.install_id
+                  and e.occurred_at >= now() - interval '7 days'
+              )
+          )::int as returning_7d,
+          count(*) filter (
+            where first_seen_at < now() - interval '30 days'
+              and exists (
+                select 1 from app_event e
+                where e.install_id = first_seen.install_id
+                  and e.occurred_at >= now() - interval '30 days'
+              )
+          )::int as returning_30d
+        from first_seen
       `),
       query(`
         select
-          count(*) filter (where occurred_at >= now() - interval '1 day') as d1,
-          count(*) filter (where occurred_at >= now() - interval '7 days') as d7,
-          count(*) filter (where occurred_at >= now() - interval '30 days') as d30
+          count(*) filter (where name = 'app_launch')::int as total,
+          count(*) filter (where name = 'app_launch' and occurred_at >= now() - interval '1 day')::int as last_1_day,
+          count(*) filter (where name = 'app_launch' and occurred_at >= now() - interval '7 days')::int as last_7_days,
+          count(*) filter (where name = 'app_launch' and occurred_at >= now() - interval '30 days')::int as last_30_days
         from app_event
-        where name = 'session_start'
+      `),
+      query(`
+        select name, count(*)::int as count
+        from app_event
+        group by name
+        order by count desc, name asc
+      `),
+      query(`
+        select
+          count(*) filter (where name = 'study_session_started')::int as study_sessions_started,
+          count(*) filter (where name = 'study_session_completed')::int as study_sessions_completed,
+          count(*) filter (where name = 'question_viewed')::int as questions_viewed,
+          count(*) filter (where name = 'answer_revealed')::int as answers_revealed,
+          count(*) filter (where name = 'answer_marked_correct')::int as correct_answers,
+          count(*) filter (where name = 'answer_marked_incorrect')::int as incorrect_answers,
+          count(*) filter (where name = 'pack_opened')::int as pack_opens,
+          count(*) filter (where name = 'pack_completed')::int as pack_completions,
+          count(*) filter (where name = 'library_opened')::int as library_opens,
+          round(avg((properties->>'duration_ms')::numeric) filter (
+            where name = 'study_session_completed'
+              and properties->>'duration_ms' ~ '^[0-9]+(\\.[0-9]+)?$'
+          ))::int as avg_session_duration_ms,
+          round(avg((properties->>'completed_count')::numeric) filter (
+            where name = 'study_session_completed'
+              and properties->>'completed_count' ~ '^[0-9]+(\\.[0-9]+)?$'
+          ), 1)::float as avg_questions_per_completed_session
+        from app_event
+      `),
+      query(`
+        select coalesce(platform, device_family, 'Unknown') as platform, count(*)::int as count
+        from app_event
+        group by coalesce(platform, device_family, 'Unknown')
+        order by count desc
+      `),
+      query(`
+        select coalesce(app_version, 'Unknown') as app_version,
+               coalesce(build_number, 'Unknown') as build_number,
+               count(distinct install_id)::int as installs,
+               count(*)::int as events
+        from app_event
+        group by app_version, build_number
+        order by events desc
+        limit 20
+      `),
+      query(`
+        select properties->>'pack_id' as pack_id, count(*)::int as count
+        from app_event
+        where name = 'question_viewed'
+          and properties ? 'pack_id'
+        group by pack_id
+        order by count desc
+        limit 25
+      `),
+      query(`
+        select properties->>'pack_id' as pack_id, count(*)::int as count
+        from app_event
+        where name = 'question_viewed'
+          and properties ? 'pack_id'
+        group by pack_id
+        order by count asc
+        limit 25
+      `),
+      query(`
+        select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+               count(*)::int as views,
+               max(properties->>'pack_id') as pack_id,
+               max(properties->>'topic') as topic
+        from app_event
+        where name = 'question_viewed'
+          and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+          and coalesce(properties->>'is_private', 'false') <> 'true'
+        group by question_id
+        order by views desc
+        limit 25
+      `),
+      query(`
+        select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+               count(*)::int as missed,
+               count(distinct install_id)::int as installs,
+               max(properties->>'pack_id') as pack_id,
+               max(properties->>'topic') as topic
+        from app_event
+        where name in ('answer_marked_incorrect', 'study_card_marked_missed')
+          and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+          and coalesce(properties->>'is_private', 'false') <> 'true'
+        group by question_id
+        order by missed desc
+        limit 25
+      `),
+      query(`
+        with viewed as (
+          select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+                 count(*)::int as views,
+                 max(properties->>'pack_id') as pack_id,
+                 max(properties->>'topic') as topic
+          from app_event
+          where name = 'question_viewed'
+            and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+            and coalesce(properties->>'is_private', 'false') <> 'true'
+          group by question_id
+        ),
+        revealed as (
+          select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+                 count(*)::int as reveals
+          from app_event
+          where name = 'answer_revealed'
+            and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+            and coalesce(properties->>'is_private', 'false') <> 'true'
+          group by question_id
+        )
+        select viewed.question_id,
+               viewed.views,
+               coalesce(revealed.reveals, 0)::int as reveals,
+               (viewed.views - coalesce(revealed.reveals, 0))::int as abandoned_before_reveal,
+               viewed.pack_id,
+               viewed.topic
+        from viewed
+        left join revealed on revealed.question_id = viewed.question_id
+        where viewed.views > coalesce(revealed.reveals, 0)
+        order by abandoned_before_reveal desc, viewed.views desc
+        limit 25
+      `),
+      query(`
+        select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+               count(*)::int as missed,
+               count(distinct install_id)::int as installs,
+               max(properties->>'pack_id') as pack_id,
+               max(properties->>'topic') as topic
+        from app_event
+        where name in ('answer_marked_incorrect', 'study_card_marked_missed')
+          and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+          and coalesce(properties->>'is_private', 'false') <> 'true'
+        group by question_id
+        having count(*) >= 2
+        order by missed desc, installs desc
+        limit 25
       `),
       query(`
         select name, count(*)::int as count
         from app_event
         where name in (
-          'study_session_started',
-          'library_opened',
-          'private_card_created',
-          'private_card_shared_completed'
+          'community_sync_failed',
+          'sign_in_with_apple_failed',
+          'purchase_failed',
+          'restore_purchase_failed',
+          'contribution_submit_failed',
+          'question_bank_bootstrap_failed'
         )
         group by name
-      `),
-      query(`
-        select properties->>'canonicalQuestionID' as canonical_question_id, count(*)::int as count
-        from app_event
-        where name in ('canonical_question_seen', 'study_card_presented', 'library_question_opened')
-          and properties ? 'canonicalQuestionID'
-        group by canonical_question_id
         order by count desc
-        limit 25
-      `),
-      query(`
-        select properties->>'canonicalQuestionID' as canonical_question_id, count(*)::int as count
-        from app_event
-        where name = 'study_card_marked_missed'
-          and properties ? 'canonicalQuestionID'
-        group by canonical_question_id
-        order by count desc
-        limit 25
-      `),
-      query(`
-        select properties->>'canonicalQuestionID' as canonical_question_id, count(*)::int as count
-        from app_event
-        where name = 'study_card_marked_got_it'
-          and properties ? 'canonicalQuestionID'
-        group by canonical_question_id
-        order by count desc
-        limit 25
-      `),
-      query(`
-        select coalesce(country, 'Unknown') as country,
-               coalesce(region, 'Unknown') as region,
-               coalesce(time_zone, 'Unknown') as time_zone,
-               count(*)::int as count
-        from app_event
-        group by country, region, time_zone
-        order by count desc
-        limit 50
-      `),
-      query(`
-        select likely_school_region, count(distinct install_id)::int as installs, count(*)::int as events
-        from app_event
-        group by likely_school_region
-        order by events desc
       `),
     ]);
 
     const counts = Object.fromEntries(eventCounts.rows.map((row) => [row.name, Number(row.count)]));
-    const studyActivity = counts.study_session_started ?? 0;
-    const libraryOpens = counts.library_opened ?? 0;
+    const study = studyBehavior.rows[0] ?? {};
+    const studySessionsStarted = Number(study.study_sessions_started ?? 0);
+    const studySessionsCompleted = Number(study.study_sessions_completed ?? 0);
+    const questionsViewed = Number(study.questions_viewed ?? 0);
+    const answersRevealed = Number(study.answers_revealed ?? 0);
+    const correctAnswers = Number(study.correct_answers ?? 0);
+    const incorrectAnswers = Number(study.incorrect_answers ?? 0);
+    const totalRatedAnswers = correctAnswers + incorrectAnswers;
+    const libraryOpens = Number(study.library_opens ?? 0);
+    const lifecycleRow = lifecycle.rows[0] ?? {};
+    const appSessionsRow = appSessions.rows[0] ?? {};
+    const funnelCount = (name) => counts[name] ?? 0;
+    const percent = (numerator, denominator) => {
+      if (!denominator) return null;
+      return Number(((numerator / denominator) * 100).toFixed(1));
+    };
+
     res.json({
-      totalAnonymousInstalls: Number(installs.rows[0]?.total ?? 0),
-      activeInstalls: {
-        last1Day: Number(activeInstalls.rows[0]?.d1 ?? 0),
-        last7Days: Number(activeInstalls.rows[0]?.d7 ?? 0),
-        last30Days: Number(activeInstalls.rows[0]?.d30 ?? 0),
+      totalEvents: Number(lifecycleRow.total_events ?? 0),
+      totalAnonymousInstalls: Number(lifecycleRow.total_anonymous_installs ?? 0),
+      activeUsers: {
+        dau: Number(lifecycleRow.active_1d ?? 0),
+        wau: Number(lifecycleRow.active_7d ?? 0),
+        mau: Number(lifecycleRow.active_30d ?? 0),
       },
-      sessions: {
-        last1Day: Number(sessions.rows[0]?.d1 ?? 0),
-        last7Days: Number(sessions.rows[0]?.d7 ?? 0),
-        last30Days: Number(sessions.rows[0]?.d30 ?? 0),
+      newUsers: {
+        last1Day: Number(lifecycleRow.new_1d ?? 0),
+        last7Days: Number(lifecycleRow.new_7d ?? 0),
+        last30Days: Number(lifecycleRow.new_30d ?? 0),
       },
-      studySessions: studyActivity,
-      libraryOpens,
-      studyToLibraryRatio: libraryOpens === 0 ? null : Number((studyActivity / libraryOpens).toFixed(2)),
-      privateCardsCreated: counts.private_card_created ?? 0,
-      privateCardsShared: counts.private_card_shared_completed ?? 0,
-      topCanonicalQuestionsByViews: topViewed.rows,
-      topCanonicalQuestionsByMissedCount: topMissed.rows,
-      topCanonicalQuestionsByGotItCount: topGotIt.rows,
-      usageByCoarseRegion: regionCounts.rows,
-      likelySchoolRegionAggregates: schoolRegionCounts.rows,
-      inferenceNotice: "likelySchoolRegion is an aggregate inference only. It is not user-visible and must not affect app behavior.",
+      returningUsers: {
+        last1Day: Number(lifecycleRow.returning_1d ?? 0),
+        last7Days: Number(lifecycleRow.returning_7d ?? 0),
+        last30Days: Number(lifecycleRow.returning_30d ?? 0),
+      },
+      appSessions: {
+        total: Number(appSessionsRow.total ?? 0),
+        last1Day: Number(appSessionsRow.last_1_day ?? 0),
+        last7Days: Number(appSessionsRow.last_7_days ?? 0),
+        last30Days: Number(appSessionsRow.last_30_days ?? 0),
+      },
+      study: {
+        sessionsStarted: studySessionsStarted,
+        sessionsCompleted: studySessionsCompleted,
+        sessionsAbandoned: Math.max(studySessionsStarted - studySessionsCompleted, 0),
+        sessionAbandonmentRate: percent(Math.max(studySessionsStarted - studySessionsCompleted, 0), studySessionsStarted),
+        averageSessionDurationMs: study.avg_session_duration_ms == null ? null : Number(study.avg_session_duration_ms),
+        averageQuestionsPerCompletedSession: study.avg_questions_per_completed_session == null ? null : Number(study.avg_questions_per_completed_session),
+        averageStudySessionsPerDay: Number((studySessionsStarted / 30).toFixed(2)),
+        questionsViewed,
+        answersRevealed,
+        revealRate: percent(answersRevealed, questionsViewed),
+        correctAnswers,
+        incorrectAnswers,
+        correctPercentage: percent(correctAnswers, totalRatedAnswers),
+        incorrectPercentage: percent(incorrectAnswers, totalRatedAnswers),
+        libraryOpens,
+        studyToLibraryRatio: libraryOpens === 0 ? null : Number((studySessionsStarted / libraryOpens).toFixed(2)),
+      },
+      content: {
+        mostStudiedPacks: mostStudiedPacks.rows,
+        leastStudiedPacks: leastStudiedPacks.rows,
+        topCanonicalQuestionsByViews: topViewedQuestions.rows,
+        mostMissedCanonicalQuestions: mostMissedQuestions.rows,
+        questionsAbandonedBeforeReveal: abandonedBeforeReveal.rows,
+        questionsRepeatedlyMissed: repeatedlyMissedQuestions.rows,
+      },
+      communityFunnel: {
+        contributionPageOpened: funnelCount("contribution_flow_opened"),
+        signInWithAppleTapped: funnelCount("sign_in_with_apple_tapped"),
+        signInSucceeded: funnelCount("sign_in_with_apple_succeeded"),
+        signInFailed: funnelCount("sign_in_with_apple_failed"),
+        contributionSubmitted: funnelCount("contribution_submitted"),
+        contributionSubmitFailed: funnelCount("contribution_submit_failed"),
+        contributionApproved: funnelCount("contribution_approved"),
+        contributionRejected: funnelCount("contribution_rejected"),
+      },
+      purchaseFunnel: {
+        purchaseScreenOpened: funnelCount("purchase_screen_opened"),
+        purchaseStarted: funnelCount("purchase_started"),
+        purchaseSucceeded: funnelCount("purchase_succeeded"),
+        purchaseFailed: funnelCount("purchase_failed"),
+        restorePurchaseStarted: funnelCount("restore_purchase_started"),
+        restorePurchaseSucceeded: funnelCount("restore_purchase_succeeded"),
+        restorePurchaseFailed: funnelCount("restore_purchase_failed"),
+        purchaseConversionPercentage: percent(funnelCount("purchase_succeeded"), funnelCount("purchase_screen_opened")),
+      },
+      privateCards: {
+        created: funnelCount("private_card_created"),
+        shared: funnelCount("private_card_shared_completed"),
+      },
+      platformBreakdown: platformBreakdown.rows,
+      appVersionBreakdown: appVersionBreakdown.rows,
+      reliabilityFailures: reliabilityFailures.rows,
+      eventCounts: counts,
+      auditNotes: [
+        "App sessions are counted from app_launch events. The previous summary queried session_start, which the app does not emit.",
+        "Canonical question tables now read question_id as emitted by the app, with canonicalQuestionID retained as a legacy fallback.",
+        "Library opens require library_opened events. Older builds only emitted question_viewed with view_context=library.",
+      ],
     });
   } catch (err) {
     console.error("[admin/analytics/summary]", err);
