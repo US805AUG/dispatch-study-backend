@@ -9,8 +9,11 @@ import {
 } from "./auth.js";
 import { query } from "./db.js";
 import { deploymentInfo } from "./deploymentInfo.js";
+import { config } from "./config.js";
 
 export const router = express.Router();
+
+const TEMP_ANALYTICS_BOOTSTRAP_USER_ID = "c665ac91-d55b-47a7-a2df-76fe4bda5874";
 
 function parseJSONValue(value) {
   if (value == null) return null;
@@ -543,6 +546,54 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
     });
   } catch (err) {
     console.error("[admin/analytics/summary]", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// TEMPORARY admin analytics bootstrap for pre-App-Store testing only.
+// Remove after analytics verification. This does not bypass analytics auth; it
+// only mints a normal backend JWT for the single known admin test user when the
+// caller knows TEMP_ADMIN_BOOTSTRAP_TOKEN from Railway environment variables.
+router.post("/admin/bootstrap-token", async (req, res) => {
+  try {
+    const expectedToken = config.tempAdminBootstrapToken;
+    const providedToken = req.get("X-Admin-Bootstrap-Token");
+    if (!expectedToken || providedToken !== expectedToken) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const before = await query(
+      "select id, role from app_user where id = $1",
+      [TEMP_ANALYTICS_BOOTSTRAP_USER_ID]
+    );
+
+    if (before.rowCount !== 1) {
+      return res.status(404).json({ error: "Bootstrap user not found" });
+    }
+
+    const previousRole = before.rows[0].role;
+    if (!["owner", "admin"].includes(previousRole)) {
+      await query(
+        "update app_user set role = 'owner', updated_at = now() where id = $1",
+        [TEMP_ANALYTICS_BOOTSTRAP_USER_ID]
+      );
+    }
+
+    const after = await query(
+      "select id, role from app_user where id = $1",
+      [TEMP_ANALYTICS_BOOTSTRAP_USER_ID]
+    );
+    const user = after.rows[0];
+    const token = await issueJwt({ id: user.id, role: user.role });
+
+    res.json({
+      userId: user.id,
+      previousRole,
+      newRole: user.role,
+      token,
+    });
+  } catch (err) {
+    console.error("[admin/bootstrap-token]", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });

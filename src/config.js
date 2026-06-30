@@ -7,6 +7,7 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL,
   jwtSecret: process.env.JWT_SECRET,
   appleAudience: process.env.APPLE_AUDIENCE,
+  tempAdminBootstrapToken: process.env.TEMP_ADMIN_BOOTSTRAP_TOKEN,
 };
 
 if (!config.databaseUrl) {
