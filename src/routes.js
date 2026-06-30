@@ -444,8 +444,11 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       leastStudiedPacks,
       topViewedQuestions,
       mostMissedQuestions,
+      lowestCorrectRateQuestions,
       abandonedBeforeReveal,
       repeatedlyMissedQuestions,
+      coarseGeography,
+      recentStudyActivity,
       reliabilityFailures,
     ] = await Promise.all([
       query(`
@@ -581,7 +584,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
                count(*)::int as views,
                max(properties->>'pack_id') as pack_id,
-               max(properties->>'topic') as topic
+               max(properties->>'topic') as topic,
+               max(properties->>'source') as source
         from app_event
         where name = 'question_viewed'
           and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
@@ -595,7 +599,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
                count(*)::int as missed,
                count(distinct install_id)::int as installs,
                max(properties->>'pack_id') as pack_id,
-               max(properties->>'topic') as topic
+               max(properties->>'topic') as topic,
+               max(properties->>'source') as source
         from app_event
         where name in ('answer_marked_incorrect', 'study_card_marked_missed')
           and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
@@ -605,11 +610,40 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         limit 25
       `),
       query(`
+        with rated as (
+          select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+                 count(*) filter (where name = 'answer_marked_correct')::int as correct,
+                 count(*) filter (where name = 'answer_marked_incorrect')::int as incorrect,
+                 count(*)::int as rated,
+                 max(properties->>'pack_id') as pack_id,
+                 max(properties->>'topic') as topic,
+                 max(properties->>'source') as source
+          from app_event
+          where name in ('answer_marked_correct', 'answer_marked_incorrect')
+            and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
+            and coalesce(properties->>'is_private', 'false') <> 'true'
+          group by question_id
+        )
+        select question_id,
+               correct,
+               incorrect,
+               rated,
+               round((correct::numeric / nullif(rated, 0)) * 100, 1)::float as correct_rate,
+               pack_id,
+               topic,
+               source
+        from rated
+        where rated > 0
+        order by correct_rate asc, rated desc
+        limit 25
+      `),
+      query(`
         with viewed as (
           select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
                  count(*)::int as views,
                  max(properties->>'pack_id') as pack_id,
-                 max(properties->>'topic') as topic
+                 max(properties->>'topic') as topic,
+                 max(properties->>'source') as source
           from app_event
           where name = 'question_viewed'
             and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
@@ -630,7 +664,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
                coalesce(revealed.reveals, 0)::int as reveals,
                (viewed.views - coalesce(revealed.reveals, 0))::int as abandoned_before_reveal,
                viewed.pack_id,
-               viewed.topic
+               viewed.topic,
+               viewed.source
         from viewed
         left join revealed on revealed.question_id = viewed.question_id
         where viewed.views > coalesce(revealed.reveals, 0)
@@ -642,7 +677,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
                count(*)::int as missed,
                count(distinct install_id)::int as installs,
                max(properties->>'pack_id') as pack_id,
-               max(properties->>'topic') as topic
+               max(properties->>'topic') as topic,
+               max(properties->>'source') as source
         from app_event
         where name in ('answer_marked_incorrect', 'study_card_marked_missed')
           and coalesce(properties->>'question_id', properties->>'canonicalQuestionID') is not null
@@ -651,6 +687,39 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         having count(*) >= 2
         order by missed desc, installs desc
         limit 25
+      `),
+      query(`
+        select coalesce(country, 'Unknown') as country,
+               coalesce(region, 'Unknown') as region,
+               coalesce(time_zone, 'Unknown') as time_zone,
+               coalesce(locale, 'Unknown') as locale,
+               count(distinct install_id)::int as installs,
+               count(*)::int as events
+        from app_event
+        group by coalesce(country, 'Unknown'),
+                 coalesce(region, 'Unknown'),
+                 coalesce(time_zone, 'Unknown'),
+                 coalesce(locale, 'Unknown')
+        order by events desc
+        limit 50
+      `),
+      query(`
+        select occurred_at,
+               coalesce(platform, device_family, 'Unknown') as platform,
+               name,
+               coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+               properties->>'result' as result,
+               properties->>'source' as source,
+               properties->>'topic' as topic
+        from app_event
+        where name in (
+          'question_viewed',
+          'answer_revealed',
+          'answer_marked_correct',
+          'answer_marked_incorrect'
+        )
+        order by occurred_at desc
+        limit 50
       `),
       query(`
         select name, count(*)::int as count
@@ -677,6 +746,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
     const correctAnswers = Number(study.correct_answers ?? 0);
     const incorrectAnswers = Number(study.incorrect_answers ?? 0);
     const totalRatedAnswers = correctAnswers + incorrectAnswers;
+    const unansweredOrUnrated = Math.max(questionsViewed - totalRatedAnswers, 0);
     const libraryOpens = Number(study.library_opens ?? 0);
     const lifecycleRow = lifecycle.rows[0] ?? {};
     const appSessionsRow = appSessions.rows[0] ?? {};
@@ -723,6 +793,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         revealRate: percent(answersRevealed, questionsViewed),
         correctAnswers,
         incorrectAnswers,
+        unansweredOrUnrated,
         correctPercentage: percent(correctAnswers, totalRatedAnswers),
         incorrectPercentage: percent(incorrectAnswers, totalRatedAnswers),
         libraryOpens,
@@ -733,6 +804,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         leastStudiedPacks: leastStudiedPacks.rows,
         topCanonicalQuestionsByViews: topViewedQuestions.rows,
         mostMissedCanonicalQuestions: mostMissedQuestions.rows,
+        lowestCorrectRateQuestions: lowestCorrectRateQuestions.rows,
         questionsAbandonedBeforeReveal: abandonedBeforeReveal.rows,
         questionsRepeatedlyMissed: repeatedlyMissedQuestions.rows,
       },
@@ -762,6 +834,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       },
       platformBreakdown: platformBreakdown.rows,
       appVersionBreakdown: appVersionBreakdown.rows,
+      coarseGeography: coarseGeography.rows,
+      recentStudyActivity: recentStudyActivity.rows,
       reliabilityFailures: reliabilityFailures.rows,
       eventCounts: counts,
       auditNotes: [
