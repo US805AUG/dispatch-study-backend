@@ -170,29 +170,32 @@ function optionalJSONObject(value, maxKeys = 40) {
 
 function coarseRegionFromRequest(req, event) {
   const header = (name) => optionalShortText(req.headers[name], 80);
-  const localeRegion = optionalShortText(event?.localeRegion, 16);
   return {
-    country: header("cf-ipcountry") ?? header("x-vercel-ip-country") ?? localeRegion ?? null,
-    region: header("x-vercel-ip-country-region") ?? header("x-railway-region") ?? null,
+    country: header("cf-ipcountry") ?? header("x-vercel-ip-country") ?? null,
+    region: header("x-vercel-ip-country-region") ?? null,
     city: header("x-vercel-ip-city") ?? null,
   };
 }
 
-function likelySchoolRegion({ country, region, city, timeZone, localeRegion }) {
-  const parts = [country, region, city, timeZone, localeRegion]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  if (parts.includes("utah") || parts.includes("america/denver") || parts.includes("st. george") || parts.includes("saint george")) {
-    return "Possible ADA / Utah";
-  }
-  if (parts.includes("texas") || parts.includes("dfw") || parts.includes("dallas") || parts.includes("fort worth") || parts.includes("america/chicago")) {
-    return "Possible IFOD / DFW school cluster";
-  }
-  if (parts.includes("florida") || parts.includes("miami") || parts.includes("fort lauderdale") || parts.includes("america/new_york")) {
-    return "Possible Sheffield / Florida";
-  }
+function likelySchoolRegion() {
+  // Legacy column retained for compatibility. Do not infer school/region from
+  // timezone or locale; those are device settings, not physical location.
   return "Unknown";
+}
+
+function geoHeaderDiagnostics(req) {
+  const header = (name) => optionalShortText(req.headers[name], 80);
+  return {
+    requestGeo: coarseRegionFromRequest(req, {}),
+    headers: {
+      xForwardedForPresent: Boolean(req.headers["x-forwarded-for"]),
+      cfIpCountry: header("cf-ipcountry"),
+      vercelCountry: header("x-vercel-ip-country"),
+      vercelRegion: header("x-vercel-ip-country-region"),
+      vercelCity: header("x-vercel-ip-city"),
+      railwayRegionPresent: Boolean(req.headers["x-railway-region"]),
+    },
+  };
 }
 
 function isUUID(value) {
@@ -374,11 +377,7 @@ router.post("/analytics/events", async (req, res) => {
       const timestamp = optionalDate(event?.timestamp);
       const properties = optionalJSONObject(event?.properties);
       const coarseRegion = coarseRegionFromRequest(req, { localeRegion });
-      const schoolRegion = likelySchoolRegion({
-        ...coarseRegion,
-        timeZone,
-        localeRegion,
-      });
+      const schoolRegion = likelySchoolRegion();
 
       const result = await query(
         `INSERT INTO app_event (
@@ -429,6 +428,11 @@ router.post("/analytics/events", async (req, res) => {
     console.error("[analytics/events] insert failed", error);
     res.status(500).json({ error: "Unable to record event." });
   }
+});
+
+router.get("/analytics/geo-diagnostics", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json(geoHeaderDiagnostics(req));
 });
 
 router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"), async (req, res) => {
@@ -592,6 +596,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
           coalesce(max(time_zone) filter (where time_zone is not null), 'Unknown') as time_zone,
           coalesce(max(country) filter (where country is not null), 'Unknown') as country,
           coalesce(max(region) filter (where region is not null), 'Unknown') as region,
+          coalesce(max(city) filter (where city is not null), 'Unknown') as city,
           min(occurred_at) as first_event_at,
           max(occurred_at) as last_event_at,
           count(*)::int as events
@@ -871,17 +876,21 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by coalesce(stats.views, 0) desc, canonical_questions.question_id asc
       `),
       query(`
-        select coalesce(country, 'Unknown') as country,
-               coalesce(region, 'Unknown') as region,
-               coalesce(time_zone, 'Unknown') as time_zone,
-               coalesce(locale, 'Unknown') as locale,
+        select coalesce(country, 'Unknown') as server_country,
+               coalesce(region, 'Unknown') as server_region,
+               coalesce(city, 'Unknown') as server_city,
+               coalesce(time_zone, 'Unknown') as device_time_zone,
+               coalesce(locale, 'Unknown') as device_locale,
+               coalesce(platform, device_family, 'Unknown') as platform,
                count(distinct install_id)::int as installs,
                count(*)::int as events
         from app_event
         group by coalesce(country, 'Unknown'),
                  coalesce(region, 'Unknown'),
+                 coalesce(city, 'Unknown'),
                  coalesce(time_zone, 'Unknown'),
-                 coalesce(locale, 'Unknown')
+                 coalesce(locale, 'Unknown'),
+                 coalesce(platform, device_family, 'Unknown')
         order by events desc
         limit 50
       `),
@@ -1029,6 +1038,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       appVersionBreakdown: appVersionBreakdown.rows,
       installDiagnostics: installDiagnostics.rows,
       coarseGeography: coarseGeography.rows,
+      geoHeaderDiagnostics: geoHeaderDiagnostics(req),
       recentStudyActivity: recentStudyActivity.rows,
       reliabilityFailures: reliabilityFailures.rows,
       eventCounts: counts,
@@ -1037,7 +1047,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         "Canonical question tables now read question_id as emitted by the app, with canonicalQuestionID retained as a legacy fallback.",
         "Session abandonment counts study_session_started events older than 30 minutes with no study_session_completed event for the same anonymous install/session within 6 hours.",
         "Abandoned before reveal counts question_viewed events older than 30 minutes with no later reveal or rating for the same anonymous install/session/question within 30 minutes.",
-        "Country/region are server-side coarse request metadata. Time zone and locale are client-provided app fields.",
+        "Server country/region/city are captured only from coarse proxy geolocation headers when present. Timezone and locale are client-provided device settings and are not physical-location proof.",
       ],
     });
   } catch (err) {
