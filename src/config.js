@@ -8,11 +8,6 @@ export const config = {
   jwtSecret: process.env.JWT_SECRET,
   appleAudience: process.env.APPLE_AUDIENCE,
   tempAdminBootstrapToken: process.env.TEMP_ADMIN_BOOTSTRAP_TOKEN,
-  analyticsInternalInstallIds: process.env.ANALYTICS_INTERNAL_INSTALL_IDS ?? "",
-  analyticsInternalUserIds: process.env.ANALYTICS_INTERNAL_USER_IDS ?? "",
-  geoIpEnabled: String(process.env.GEOIP_ENABLED ?? "false").toLowerCase() === "true",
-  geoIpProvider: String(process.env.GEOIP_PROVIDER ?? "disabled").toLowerCase(),
-  geoIpApiKey: process.env.GEOIP_API_KEY,
 };
 
 if (!config.databaseUrl) {

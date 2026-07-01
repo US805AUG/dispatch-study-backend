@@ -98,7 +98,6 @@ async function runMigrations() {
     country text,
     region text,
     city text,
-    geolocation_source text,
     likely_school_region text NOT NULL DEFAULT 'Unknown',
     occurred_at timestamptz NOT NULL DEFAULT now(),
     created_at timestamptz NOT NULL DEFAULT now()
@@ -112,7 +111,6 @@ async function runMigrations() {
   await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS country text");
   await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS region text");
   await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS city text");
-  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS geolocation_source text");
   await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS likely_school_region text NOT NULL DEFAULT 'Unknown'");
   await query("CREATE INDEX IF NOT EXISTS idx_app_event_name_created ON app_event(name, created_at)");
   await query("CREATE INDEX IF NOT EXISTS idx_app_event_install_created ON app_event(install_id, created_at)");
