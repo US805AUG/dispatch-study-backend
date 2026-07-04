@@ -170,10 +170,14 @@ function optionalJSONObject(value, maxKeys = 40) {
 
 function coarseRegionFromRequest(req, event) {
   const header = (name) => optionalShortText(req.headers[name], 80);
+  const country = header("cf-ipcountry") ?? header("x-vercel-ip-country") ?? null;
+  const region = header("x-vercel-ip-country-region") ?? null;
+  const city = header("x-vercel-ip-city") ?? null;
   return {
-    country: header("cf-ipcountry") ?? header("x-vercel-ip-country") ?? null,
-    region: header("x-vercel-ip-country-region") ?? null,
-    city: header("x-vercel-ip-city") ?? null,
+    country,
+    region,
+    city,
+    source: country || region || city ? "proxy_header" : "unavailable",
   };
 }
 
@@ -196,6 +200,97 @@ function geoHeaderDiagnostics(req) {
       railwayRegionPresent: Boolean(req.headers["x-railway-region"]),
     },
   };
+}
+
+function analyticsAlias(properties) {
+  const value = properties?.anonymous_alias ?? properties?.public_alias;
+  return optionalShortText(value, 80);
+}
+
+function analyticsDedupeKey({ installId, name, timestamp, properties }) {
+  const sessionId = typeof properties?.anonymous_session_id === "string" ? properties.anonymous_session_id : "";
+  const questionId = typeof properties?.question_id === "string"
+    ? properties.question_id
+    : typeof properties?.canonicalQuestionID === "string"
+      ? properties.canonicalQuestionID
+      : "";
+  const result = typeof properties?.result === "string" ? properties.result : "";
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify([installId, name, timestamp ?? "", sessionId, questionId, result, properties ?? {}]))
+    .digest("hex");
+}
+
+export const analyticsTestHooks = {
+  analyticsDedupeKey,
+  analyticsScope,
+  requestedAnalyticsSegment,
+  withScopedAppEvent,
+};
+
+function commaListEnv(name) {
+  return String(process.env[name] ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function requestedAnalyticsSegment(value) {
+  return ["all", "real", "internal"].includes(value) ? value : "all";
+}
+
+function analyticsScope(segment) {
+  const internalInstallIds = commaListEnv("ANALYTICS_INTERNAL_INSTALL_IDS");
+  const internalUserIds = commaListEnv("ANALYTICS_INTERNAL_USER_IDS");
+  const internalPredicate = `(
+    (array_length($1::text[], 1) is not null and install_id = any($1::text[]))
+    or (array_length($2::text[], 1) is not null and properties->>'user_id' = any($2::text[]))
+  )`;
+  if (segment === "internal") {
+    return internalInstallIds.length === 0 && internalUserIds.length === 0
+      ? { params: [internalInstallIds, internalUserIds], cte: "select * from public.app_event where false", internalInstallIds, internalUserIds }
+      : { params: [internalInstallIds, internalUserIds], cte: `select * from public.app_event where ${internalPredicate}`, internalInstallIds, internalUserIds };
+  }
+  if (segment === "real" && (internalInstallIds.length > 0 || internalUserIds.length > 0)) {
+    return {
+      params: [internalInstallIds, internalUserIds],
+      cte: `select * from public.app_event where not ${internalPredicate}`,
+      internalInstallIds,
+      internalUserIds,
+    };
+  }
+  return {
+    params: [internalInstallIds, internalUserIds],
+    cte: "select * from public.app_event where ($1::text[] is not null or true) and ($2::text[] is not null or true)",
+    internalInstallIds,
+    internalUserIds,
+  };
+}
+
+function withScopedAppEvent(sql, scope) {
+  const trimmed = sql.trimStart();
+  if (/^with\b/i.test(trimmed)) {
+    return trimmed.replace(/^with\b/i, `with app_event as (${scope.cte}),`);
+  }
+  return `with app_event as (${scope.cte}) ${trimmed}`;
+}
+
+function scopedQuery(scope, sql, params = []) {
+  return query(withScopedAppEvent(sql, scope), [...scope.params, ...params]);
+}
+
+function sectionFallback(name) {
+  if (name === "eventCounts") return { rows: [] };
+  return { rows: [{}] };
+}
+
+async function summarySection(name, fn, diagnostics) {
+  try {
+    return await fn();
+  } catch (error) {
+    diagnostics.push({ section: name, message: error?.message ?? "Unknown analytics summary error" });
+    return sectionFallback(name);
+  }
 }
 
 function isUUID(value) {
@@ -378,6 +473,8 @@ router.post("/analytics/events", async (req, res) => {
       const properties = optionalJSONObject(event?.properties);
       const coarseRegion = coarseRegionFromRequest(req, { localeRegion });
       const schoolRegion = likelySchoolRegion();
+      const anonymousAlias = analyticsAlias(properties);
+      const dedupeKey = analyticsDedupeKey({ installId, name, timestamp, properties });
 
       const result = await query(
         `INSERT INTO app_event (
@@ -396,9 +493,13 @@ router.post("/analytics/events", async (req, res) => {
           country,
           region,
           city,
+          geolocation_source,
+          anonymous_alias,
+          event_dedupe_key,
           likely_school_region,
           occurred_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,COALESCE($17::timestamptz, now()))
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,COALESCE($20::timestamptz, now()))
+        ON CONFLICT (event_dedupe_key) WHERE event_dedupe_key IS NOT NULL DO NOTHING
         RETURNING id`,
         [
           crypto.randomUUID(),
@@ -416,11 +517,16 @@ router.post("/analytics/events", async (req, res) => {
           coarseRegion.country,
           coarseRegion.region,
           coarseRegion.city,
+          coarseRegion.source,
+          anonymousAlias,
+          dedupeKey,
           schoolRegion,
           timestamp,
         ]
       );
-      insertedIds.push(result.rows[0].id);
+      if (result.rows[0]?.id) {
+        insertedIds.push(result.rows[0].id);
+      }
     }
 
     res.status(202).json({ ok: true, inserted: insertedIds.length, ids: insertedIds });
@@ -437,6 +543,24 @@ router.get("/analytics/geo-diagnostics", (req, res) => {
 
 router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"), async (req, res) => {
   try {
+    const segment = requestedAnalyticsSegment(req.query?.segment);
+    const scope = analyticsScope(segment);
+    const summaryDiagnostics = [];
+    if (segment !== req.query?.segment && req.query?.segment != null) {
+      summaryDiagnostics.push({ section: "segment", message: "Unknown segment requested; defaulted to all activity." });
+    }
+    if (segment === "internal" && scope.internalInstallIds.length === 0 && scope.internalUserIds.length === 0) {
+      summaryDiagnostics.push({ section: "segment", message: "No internal install IDs are configured." });
+    }
+    const safeAnalyticsQuery = async (sql) => {
+      try {
+        return await scopedQuery(scope, sql);
+      } catch (error) {
+        summaryDiagnostics.push({ section: "query", message: error?.message ?? "Analytics summary query failed." });
+        return { rows: [] };
+      }
+    };
+
     const [
       lifecycle,
       appSessions,
@@ -457,7 +581,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       recentStudyActivity,
       reliabilityFailures,
     ] = await Promise.all([
-      query(`
+      safeAnalyticsQuery(`
         with first_seen as (
           select install_id, min(occurred_at) as first_seen_at
           from app_event
@@ -517,7 +641,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
           )::int as returning_30d
         from first_seen
       `),
-      query(`
+      safeAnalyticsQuery(`
         select
           count(*) filter (where name = 'app_launch')::int as total,
           count(*) filter (where name = 'app_launch' and occurred_at >= now() - interval '1 day')::int as last_1_day,
@@ -525,13 +649,13 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
           count(*) filter (where name = 'app_launch' and occurred_at >= now() - interval '30 days')::int as last_30_days
         from app_event
       `),
-      query(`
+      safeAnalyticsQuery(`
         select name, count(*)::int as count
         from app_event
         group by name
         order by count desc, name asc
       `),
-      query(`
+      safeAnalyticsQuery(`
         select
           count(*) filter (where name = 'study_session_started')::int as study_sessions_started,
           count(*) filter (where name = 'study_session_completed')::int as study_sessions_completed,
@@ -555,6 +679,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
           count(*) filter (where name = 'pack_opened')::int as pack_opens,
           count(*) filter (where name = 'pack_completed')::int as pack_completions,
           count(*) filter (where name = 'library_opened')::int as library_opens,
+          count(*) filter (where name = 'question_viewed' and properties->>'view_context' = 'library')::int as library_question_views,
           round(avg((properties->>'duration_ms')::numeric) filter (
             where name = 'study_session_completed'
               and properties->>'duration_ms' ~ '^[0-9]+(\\.[0-9]+)?$'
@@ -565,13 +690,13 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
           ), 1)::float as avg_questions_per_completed_session
         from app_event
       `),
-      query(`
+      safeAnalyticsQuery(`
         select coalesce(platform, device_family, 'Unknown') as platform, count(*)::int as count
         from app_event
         group by coalesce(platform, device_family, 'Unknown')
         order by count desc
       `),
-      query(`
+      safeAnalyticsQuery(`
         select coalesce(app_version, 'Unknown') as app_version,
                coalesce(build_number, 'Unknown') as build_number,
                count(distinct install_id)::int as installs,
@@ -581,13 +706,14 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by events desc
         limit 20
       `),
-      query(`
+      safeAnalyticsQuery(`
         select
           case
             when install_id is null then 'unknown'
             when length(install_id) <= 12 then install_id
             else left(install_id, 8) || '...' || right(install_id, 4)
           end as install_label,
+          coalesce(max(anonymous_alias) filter (where anonymous_alias is not null), 'Unknown') as anonymous_alias,
           coalesce(max(platform) filter (where platform is not null), 'Unknown') as platform,
           coalesce(max(device_family) filter (where device_family is not null), 'Unknown') as device_family,
           coalesce(max(app_version) filter (where app_version is not null), 'Unknown') as app_version,
@@ -597,6 +723,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
           coalesce(max(country) filter (where country is not null), 'Unknown') as country,
           coalesce(max(region) filter (where region is not null), 'Unknown') as region,
           coalesce(max(city) filter (where city is not null), 'Unknown') as city,
+          coalesce(max(geolocation_source) filter (where geolocation_source is not null), 'unavailable') as geo_source,
+          'unknown' as likely_segment,
           min(occurred_at) as first_event_at,
           max(occurred_at) as last_event_at,
           count(*)::int as events
@@ -606,7 +734,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by last_event_at desc
         limit 100
       `),
-      query(`
+      safeAnalyticsQuery(`
         select properties->>'pack_id' as pack_id, count(*)::int as count
         from app_event
         where name = 'question_viewed'
@@ -615,7 +743,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by count desc
         limit 25
       `),
-      query(`
+      safeAnalyticsQuery(`
         select properties->>'pack_id' as pack_id, count(*)::int as count
         from app_event
         where name = 'question_viewed'
@@ -624,7 +752,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by count asc
         limit 25
       `),
-      query(`
+      safeAnalyticsQuery(`
         with question_events as (
           select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
                  count(*)::int as views,
@@ -652,7 +780,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by question_events.views desc
         limit 25
       `),
-      query(`
+      safeAnalyticsQuery(`
         with question_events as (
           select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
                  count(*)::int as missed,
@@ -682,7 +810,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by question_events.missed desc
         limit 25
       `),
-      query(`
+      safeAnalyticsQuery(`
         with rated as (
           select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
                  count(*) filter (where name = 'answer_marked_correct')::int as correct,
@@ -716,7 +844,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by correct_rate asc, rated.rated desc
         limit 25
       `),
-      query(`
+      safeAnalyticsQuery(`
         with viewed as (
           select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
                  count(*)::int as views,
@@ -777,7 +905,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by abandoned_views.abandoned_before_reveal desc, viewed.views desc
         limit 25
       `),
-      query(`
+      safeAnalyticsQuery(`
         with question_events as (
           select coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
                  count(*)::int as missed,
@@ -808,7 +936,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by question_events.missed desc, question_events.installs desc
         limit 25
       `),
-      query(`
+      safeAnalyticsQuery(`
         with canonical_questions as (
           select stable_id as question_id,
                  left(coalesce(nullif(truth_statement_text, ''), prompt_text), 120) as question_text,
@@ -822,7 +950,9 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         resolved_events as (
           select coalesce(study_question.stable_id, coalesce(app_event.properties->>'question_id', app_event.properties->>'canonicalQuestionID')) as question_id,
                  app_event.install_id,
-                 app_event.name
+                 app_event.name,
+                 app_event.occurred_at,
+                 coalesce(app_event.properties->>'anonymous_session_id', '') as anonymous_session_id
           from app_event
           left join study_question
             on study_question.stable_id = coalesce(app_event.properties->>'question_id', app_event.properties->>'canonicalQuestionID')
@@ -854,6 +984,23 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
             having count(*) >= 2
           ) repeated
           group by question_id
+        ),
+        abandoned_views as (
+          select viewed.question_id, count(*)::int as abandoned_before_reveal
+          from resolved_events viewed
+          where viewed.name = 'question_viewed'
+            and viewed.occurred_at < now() - interval '30 minutes'
+            and not exists (
+              select 1
+              from resolved_events next_event
+              where next_event.install_id = viewed.install_id
+                and next_event.anonymous_session_id = viewed.anonymous_session_id
+                and next_event.question_id = viewed.question_id
+                and next_event.name in ('answer_revealed', 'answer_marked_correct', 'answer_marked_incorrect')
+                and next_event.occurred_at >= viewed.occurred_at
+                and next_event.occurred_at <= viewed.occurred_at + interval '30 minutes'
+            )
+          group by viewed.question_id
         )
         select canonical_questions.question_id,
                canonical_questions.question_text,
@@ -865,6 +1012,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
                coalesce(stats.reveals, 0)::int as reveals,
                coalesce(stats.correct, 0)::int as correct,
                coalesce(stats.incorrect, 0)::int as incorrect,
+               coalesce(stats.incorrect, 0)::int as missed_count,
+               coalesce(abandoned_views.abandoned_before_reveal, 0)::int as abandoned_before_reveal,
                round((coalesce(stats.reveals, 0)::numeric / nullif(stats.views, 0)) * 100, 1)::float as reveal_rate,
                round((coalesce(stats.correct, 0)::numeric / nullif(stats.rated, 0)) * 100, 1)::float as correct_rate,
                round((coalesce(stats.incorrect, 0)::numeric / nullif(stats.rated, 0)) * 100, 1)::float as incorrect_rate,
@@ -873,12 +1022,14 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         from canonical_questions
         left join stats on stats.question_id = canonical_questions.question_id
         left join repeat_misses on repeat_misses.question_id = canonical_questions.question_id
+        left join abandoned_views on abandoned_views.question_id = canonical_questions.question_id
         order by coalesce(stats.views, 0) desc, canonical_questions.question_id asc
       `),
-      query(`
+      safeAnalyticsQuery(`
         select coalesce(country, 'Unknown') as server_country,
                coalesce(region, 'Unknown') as server_region,
                coalesce(city, 'Unknown') as server_city,
+               coalesce(geolocation_source, 'unavailable') as geo_source,
                coalesce(time_zone, 'Unknown') as device_time_zone,
                coalesce(locale, 'Unknown') as device_locale,
                coalesce(platform, device_family, 'Unknown') as platform,
@@ -888,13 +1039,14 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         group by coalesce(country, 'Unknown'),
                  coalesce(region, 'Unknown'),
                  coalesce(city, 'Unknown'),
+                 coalesce(geolocation_source, 'unavailable'),
                  coalesce(time_zone, 'Unknown'),
                  coalesce(locale, 'Unknown'),
                  coalesce(platform, device_family, 'Unknown')
         order by events desc
         limit 50
       `),
-      query(`
+      safeAnalyticsQuery(`
         select occurred_at,
                coalesce(platform, device_family, 'Unknown') as platform,
                coalesce(app_version, 'Unknown') as app_version,
@@ -921,7 +1073,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by occurred_at desc
         limit 50
       `),
-      query(`
+      safeAnalyticsQuery(`
         select name, count(*)::int as count
         from app_event
         where name in (
@@ -949,6 +1101,41 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
     const unansweredOrUnrated = Math.max(questionsViewed - totalRatedAnswers, 0);
     const studySessionsAbandoned = Number(study.study_sessions_abandoned ?? 0);
     const libraryOpens = Number(study.library_opens ?? 0);
+    const libraryQuestionViews = Number(study.library_question_views ?? 0);
+    let internalDiagnostics = { rows: [] };
+    if (segment !== "real" && (scope.internalInstallIds.length > 0 || scope.internalUserIds.length > 0)) {
+      try {
+        internalDiagnostics = await query(`
+          select
+            case
+              when install_id is null then 'unknown'
+              when length(install_id) <= 12 then install_id
+              else left(install_id, 8) || '...' || right(install_id, 4)
+            end as install_label,
+            coalesce(max(anonymous_alias) filter (where anonymous_alias is not null), 'Unknown') as anonymous_alias,
+            coalesce(max(platform) filter (where platform is not null), 'Unknown') as platform,
+            coalesce(max(app_version) filter (where app_version is not null), 'Unknown') as app_version,
+            coalesce(max(build_number) filter (where build_number is not null), 'Unknown') as build_number,
+            coalesce(max(locale) filter (where locale is not null), 'Unknown') as locale,
+            coalesce(max(time_zone) filter (where time_zone is not null), 'Unknown') as time_zone,
+            min(occurred_at) as first_event_at,
+            max(occurred_at) as last_event_at,
+            count(*)::int as events,
+            case
+              when install_id = any($1::text[]) then 'ANALYTICS_INTERNAL_INSTALL_IDS'
+              else 'ANALYTICS_INTERNAL_USER_IDS'
+            end as reason
+          from app_event
+          where install_id = any($1::text[])
+             or properties->>'user_id' = any($2::text[])
+          group by install_id
+          order by last_event_at desc
+          limit 100
+        `, [scope.internalInstallIds, scope.internalUserIds]);
+      } catch (error) {
+        summaryDiagnostics.push({ section: "internalDiagnostics", message: error?.message ?? "Internal diagnostics query failed." });
+      }
+    }
     const lifecycleRow = lifecycle.rows[0] ?? {};
     const appSessionsRow = appSessions.rows[0] ?? {};
     const funnelCount = (name) => counts[name] ?? 0;
@@ -958,6 +1145,8 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
     };
 
     res.json({
+      segment,
+      diagnostics: summaryDiagnostics,
       totalEvents: Number(lifecycleRow.total_events ?? 0),
       totalAnonymousInstalls: Number(lifecycleRow.total_anonymous_installs ?? 0),
       activeUsers: {
@@ -998,7 +1187,9 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         correctPercentage: percent(correctAnswers, totalRatedAnswers),
         incorrectPercentage: percent(incorrectAnswers, totalRatedAnswers),
         libraryOpens,
-        studyToLibraryRatio: libraryOpens === 0 ? null : Number((studySessionsStarted / libraryOpens).toFixed(2)),
+        libraryQuestionViews,
+        libraryActivity: libraryOpens + libraryQuestionViews,
+        studyToLibraryRatio: (libraryOpens + libraryQuestionViews) === 0 ? null : Number((studySessionsStarted / (libraryOpens + libraryQuestionViews)).toFixed(2)),
       },
       content: {
         mostStudiedPacks: mostStudiedPacks.rows,
@@ -1009,6 +1200,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         questionsAbandonedBeforeReveal: abandonedBeforeReveal.rows,
         questionsRepeatedlyMissed: repeatedlyMissedQuestions.rows,
         canonicalQuestionAnalytics: canonicalQuestionAnalytics.rows,
+        questionPerformance: canonicalQuestionAnalytics.rows,
       },
       communityFunnel: {
         contributionPageOpened: funnelCount("contribution_flow_opened"),
@@ -1037,6 +1229,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       platformBreakdown: platformBreakdown.rows,
       appVersionBreakdown: appVersionBreakdown.rows,
       installDiagnostics: installDiagnostics.rows,
+      internalDiagnostics: internalDiagnostics.rows,
       coarseGeography: coarseGeography.rows,
       geoHeaderDiagnostics: geoHeaderDiagnostics(req),
       recentStudyActivity: recentStudyActivity.rows,

@@ -98,6 +98,9 @@ async function runMigrations() {
     country text,
     region text,
     city text,
+    geolocation_source text,
+    anonymous_alias text,
+    event_dedupe_key text,
     likely_school_region text NOT NULL DEFAULT 'Unknown',
     occurred_at timestamptz NOT NULL DEFAULT now(),
     created_at timestamptz NOT NULL DEFAULT now()
@@ -111,15 +114,25 @@ async function runMigrations() {
   await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS country text");
   await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS region text");
   await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS city text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS geolocation_source text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS anonymous_alias text");
+  await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS event_dedupe_key text");
   await query("ALTER TABLE app_event ADD COLUMN IF NOT EXISTS likely_school_region text NOT NULL DEFAULT 'Unknown'");
   await query("CREATE INDEX IF NOT EXISTS idx_app_event_name_created ON app_event(name, created_at)");
   await query("CREATE INDEX IF NOT EXISTS idx_app_event_install_created ON app_event(install_id, created_at)");
   await query("CREATE INDEX IF NOT EXISTS idx_app_event_likely_region ON app_event(likely_school_region)");
+  await query("CREATE INDEX IF NOT EXISTS idx_app_event_occurred_at ON app_event(occurred_at)");
+  await query("CREATE INDEX IF NOT EXISTS idx_app_event_question_id ON app_event((coalesce(properties->>'question_id', properties->>'canonicalQuestionID')))");
+  await query("CREATE INDEX IF NOT EXISTS idx_app_event_view_context ON app_event((properties->>'view_context'))");
+  await query("CREATE UNIQUE INDEX IF NOT EXISTS idx_app_event_dedupe_key ON app_event(event_dedupe_key) WHERE event_dedupe_key IS NOT NULL");
   console.log("Migrations complete.");
 }
 
-app.listen(config.port, async () => {
+await runMigrations().catch((e) => {
+  console.error("Migration error:", e.message);
+});
+
+app.listen(config.port, () => {
   console.log(`Backend listening on ${config.port}`);
   console.log("[deployment]", deploymentInfo);
-  await runMigrations().catch((e) => console.error("Migration error:", e.message));
 });

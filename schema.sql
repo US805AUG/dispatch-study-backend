@@ -84,6 +84,9 @@ create table if not exists app_event (
   country text,
   region text,
   city text,
+  geolocation_source text,
+  anonymous_alias text,
+  event_dedupe_key text,
   likely_school_region text not null default 'Unknown',
   occurred_at timestamptz not null default now(),
   created_at timestamptz not null default now()
@@ -99,6 +102,10 @@ create index if not exists idx_question_updated on study_question(updated_at);
 create index if not exists idx_app_event_name_created on app_event(name, created_at);
 create index if not exists idx_app_event_install_created on app_event(install_id, created_at);
 create index if not exists idx_app_event_likely_region on app_event(likely_school_region);
+create index if not exists idx_app_event_occurred_at on app_event(occurred_at);
+create index if not exists idx_app_event_question_id on app_event((coalesce(properties->>'question_id', properties->>'canonicalQuestionID')));
+create index if not exists idx_app_event_view_context on app_event((properties->>'view_context'));
+create unique index if not exists idx_app_event_dedupe_key on app_event(event_dedupe_key) where event_dedupe_key is not null;
 
 -- Migration: run once in Railway SQL editor if the table already exists
 -- alter table study_question add column if not exists source_origin text default '';
