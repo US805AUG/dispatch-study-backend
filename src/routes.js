@@ -577,6 +577,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       abandonedBeforeReveal,
       repeatedlyMissedQuestions,
       canonicalQuestionAnalytics,
+      perUserStudyActivity,
       coarseGeography,
       recentStudyActivity,
       reliabilityFailures,
@@ -724,7 +725,13 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
           coalesce(max(region) filter (where region is not null), 'Unknown') as region,
           coalesce(max(city) filter (where city is not null), 'Unknown') as city,
           coalesce(max(geolocation_source) filter (where geolocation_source is not null), 'unavailable') as geo_source,
-          'unknown' as likely_segment,
+          case
+            when (
+              (array_length($1::text[], 1) is not null and install_id = any($1::text[]))
+              or (array_length($2::text[], 1) is not null and max(properties->>'user_id') = any($2::text[]))
+            ) then 'internal/test'
+            else 'real'
+          end as likely_segment,
           min(occurred_at) as first_event_at,
           max(occurred_at) as last_event_at,
           count(*)::int as events
@@ -1026,6 +1033,140 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
         order by coalesce(stats.views, 0) desc, canonical_questions.question_id asc
       `),
       safeAnalyticsQuery(`
+        with event_base as (
+          select
+            install_id,
+            name,
+            platform,
+            device_family,
+            app_version,
+            build_number,
+            anonymous_alias,
+            properties,
+            occurred_at,
+            coalesce(properties->>'question_id', properties->>'canonicalQuestionID') as question_id,
+            properties->>'view_context' as view_context
+          from app_event
+          where install_id is not null
+        ),
+        per_install as (
+          select
+            install_id,
+            case
+              when length(install_id) <= 12 then install_id
+              else left(install_id, 8) || '...' || right(install_id, 4)
+            end as install_label,
+            coalesce(max(anonymous_alias) filter (where anonymous_alias is not null), 'Unknown') as anonymous_alias,
+            coalesce(max(platform) filter (where platform is not null), max(device_family) filter (where device_family is not null), 'Unknown') as platform,
+            coalesce(max(app_version) filter (where app_version is not null), 'Unknown') as app_version,
+            coalesce(max(build_number) filter (where build_number is not null), 'Unknown') as build_number,
+            min(occurred_at) as first_event_at,
+            max(occurred_at) as last_event_at,
+            count(*)::int as total_events,
+            count(*) filter (where name = 'app_launch')::int as app_launches,
+            count(*) filter (where name = 'study_session_started')::int as study_sessions_started,
+            count(*) filter (where name = 'study_session_completed')::int as study_sessions_completed,
+            count(*) filter (where name = 'question_viewed')::int as question_views,
+            count(*) filter (where name = 'library_opened')::int as library_opens,
+            count(*) filter (where name = 'question_viewed' and view_context = 'library')::int as library_question_views,
+            count(*) filter (where name = 'answer_revealed')::int as answer_reveals,
+            count(*) filter (where name = 'answer_marked_correct')::int as correct_marks,
+            count(*) filter (where name = 'answer_marked_incorrect')::int as incorrect_marks,
+            count(*) filter (where name = 'contribution_flow_opened')::int as contribution_opens,
+            count(*) filter (where name = 'contribution_submitted')::int as contribution_submits,
+            count(*) filter (where name = 'sign_in_with_apple_tapped')::int as sign_in_tapped,
+            count(*) filter (where name = 'sign_in_with_apple_succeeded')::int as sign_in_succeeded,
+            count(*) filter (where name = 'sign_in_with_apple_failed')::int as sign_in_failed,
+            case
+              when (
+                (array_length($1::text[], 1) is not null and install_id = any($1::text[]))
+                or (array_length($2::text[], 1) is not null and max(properties->>'user_id') = any($2::text[]))
+              ) then 'internal/test'
+              else 'real'
+            end as segment_status
+          from event_base
+          group by install_id
+        ),
+        last_question as (
+          select distinct on (install_id)
+            install_id,
+            question_id,
+            name as last_question_event,
+            occurred_at as last_question_at
+          from event_base
+          where question_id is not null
+            and name in ('question_viewed', 'answer_revealed', 'answer_marked_correct', 'answer_marked_incorrect')
+          order by install_id, occurred_at desc
+        ),
+        question_counts as (
+          select
+            install_id,
+            question_id,
+            count(*)::int as events
+          from event_base
+          where question_id is not null
+            and name in ('question_viewed', 'answer_revealed', 'answer_marked_correct', 'answer_marked_incorrect')
+          group by install_id, question_id
+        ),
+        top_question as (
+          select install_id, question_id, events
+          from (
+            select
+              question_counts.*,
+              row_number() over (partition by install_id order by events desc, question_id asc) as rank
+            from question_counts
+          ) ranked
+          where rank = 1
+        )
+        select
+          per_install.install_label,
+          per_install.anonymous_alias,
+          per_install.platform,
+          per_install.app_version,
+          per_install.build_number,
+          per_install.first_event_at,
+          per_install.last_event_at,
+          per_install.total_events,
+          per_install.app_launches,
+          per_install.study_sessions_started,
+          per_install.study_sessions_completed,
+          per_install.question_views,
+          per_install.library_opens,
+          per_install.library_question_views,
+          (per_install.library_opens + per_install.library_question_views)::int as library_activity,
+          per_install.answer_reveals,
+          per_install.correct_marks,
+          per_install.incorrect_marks,
+          round((per_install.answer_reveals::numeric / nullif(per_install.question_views, 0)) * 100, 1)::float as reveal_rate,
+          round((per_install.correct_marks::numeric / nullif(per_install.correct_marks + per_install.incorrect_marks, 0)) * 100, 1)::float as correct_rate,
+          per_install.contribution_opens,
+          per_install.contribution_submits,
+          per_install.sign_in_tapped,
+          per_install.sign_in_succeeded,
+          per_install.sign_in_failed,
+          last_question.question_id as last_question_id,
+          coalesce(nullif(left(coalesce(nullif(last_study_question.truth_statement_text, ''), last_study_question.prompt_text), 120), ''), last_question.question_id) as last_question_text,
+          last_question.last_question_event,
+          last_question.last_question_at,
+          top_question.question_id as top_question_id,
+          coalesce(nullif(left(coalesce(nullif(top_study_question.truth_statement_text, ''), top_study_question.prompt_text), 120), ''), top_question.question_id) as top_question_text,
+          top_question.events as top_question_events,
+          per_install.segment_status
+        from per_install
+        left join last_question on last_question.install_id = per_install.install_id
+        left join study_question last_study_question
+          on last_study_question.stable_id = last_question.question_id
+          or last_study_question.canonical_stable_id = last_question.question_id
+          or last_study_question.id::text = last_question.question_id
+        left join top_question on top_question.install_id = per_install.install_id
+        left join study_question top_study_question
+          on top_study_question.stable_id = top_question.question_id
+          or top_study_question.canonical_stable_id = top_question.question_id
+          or top_study_question.id::text = top_question.question_id
+        order by per_install.last_event_at desc
+        limit 100
+      `),
+      safeAnalyticsQuery(`
         select coalesce(country, 'Unknown') as server_country,
                coalesce(region, 'Unknown') as server_region,
                coalesce(city, 'Unknown') as server_city,
@@ -1229,6 +1370,7 @@ router.get("/admin/analytics/summary", requireAuth, requireRole("owner", "admin"
       platformBreakdown: platformBreakdown.rows,
       appVersionBreakdown: appVersionBreakdown.rows,
       installDiagnostics: installDiagnostics.rows,
+      perUserStudyActivity: perUserStudyActivity.rows,
       internalDiagnostics: internalDiagnostics.rows,
       coarseGeography: coarseGeography.rows,
       geoHeaderDiagnostics: geoHeaderDiagnostics(req),
