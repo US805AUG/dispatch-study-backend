@@ -17,3 +17,24 @@ export async function query(text, params = []) {
     client.release();
   }
 }
+
+export async function withTransaction(operation) {
+  const client = await pool.connect();
+  try {
+    return await runTransactionOnClient(client, operation);
+  } finally {
+    client.release();
+  }
+}
+
+export async function runTransactionOnClient(client, operation) {
+  await client.query("BEGIN");
+  try {
+    const result = await operation(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
+}
