@@ -11,7 +11,7 @@ export async function verifyAppleIdentityToken(identityToken) {
   if (!identityToken) throw new Error("Missing Apple identity token.");
   const { payload } = await jwtVerify(identityToken, appleJWKS, {
     issuer: "https://appleid.apple.com",
-    audience: config.appleAudience,
+    audience: config.appleAudiences,
   });
   return payload;
 }

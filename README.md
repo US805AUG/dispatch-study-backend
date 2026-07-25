@@ -13,7 +13,7 @@ Create a `.env` file with:
 PORT=8080
 DATABASE_URL=postgres://USER:PASSWORD@HOST:PORT/DB
 JWT_SECRET=replace_me_with_a_long_random_string
-APPLE_AUDIENCE=com.samg.Flight-Dispatch-Question-Bank
+APPLE_AUDIENCE=com.samg.Flight-Dispatch-Question-Bank,com.samg.study-ops
 ```
 
 ## Local dev
@@ -34,4 +34,3 @@ npm run dev
 ## Schema
 
 Apply `schema.sql` to your Postgres database.
-
