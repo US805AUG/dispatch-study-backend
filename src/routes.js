@@ -1515,97 +1515,103 @@ router.post(
   requireAuth,
   requireRole("owner"),
   express.text({ type: ["text/csv", "text/plain"], limit: "10mb" }),
-  async (req, res) => {
-    try {
-      const csvText = typeof req.body === "string" ? req.body : "";
-      const dryRun = req.query.dry_run !== "false";
-
-      if (dryRun) {
-        const { rows } = await query(
-          `select stable_id, content_hash, truth_statement_text
-           from study_question`
-        );
-        const evaluation = evaluateOwnerQuestionCSV(csvText, rows);
-        return res.json({ ...publicImportResult(evaluation), dryRun: true, imported: 0 });
-      }
-
-      const committed = await withTransaction(async (client) => {
-        await client.query("LOCK TABLE study_question IN SHARE ROW EXCLUSIVE MODE");
-        const { rows } = await client.query(
-          `select stable_id, content_hash, truth_statement_text
-           from study_question`
-        );
-        const evaluation = evaluateOwnerQuestionCSV(csvText, rows);
-        if (!evaluation.ok) return { evaluation, imported: 0 };
-
-        for (const item of evaluation.validRows) {
-          const questionId = crypto.randomUUID();
-          const submissionId = crypto.randomUUID();
-          await client.query(
-            `insert into study_question
-               (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
-                truth_statement_text, cloze_variants_json, source_origin, status,
-                created_by_user_id, canonical_stable_id, moderation_status, content_hash,
-                is_local_only, is_community_question, submitted_to_community_at, created_at, updated_at)
-             values
-               ($1,$2,$3,$4,$5,$6,$6,$6,null,'owner-csv-import','published',
-                $7,$2,'published',$8,false,true,now(),now(),now())`,
-            [
-              questionId,
-              item.stableId,
-              OWNER_IMPORT_PACK_ID,
-              item.category,
-              item.tags,
-              item.statement,
-              req.user.sub,
-              item.contentHash,
-            ]
-          );
-          await client.query(
-            `insert into study_submission
-               (id, question_id, stable_id, content_pack_id, topic, tags, prompt_text,
-                answer_text, truth_statement_text, authored_text, cloze_variants_json,
-                submitter_id, submitter_alias, reason, note, status, content_hash,
-                canonical_stable_id, created_at, updated_at)
-             values
-               ($1,$2,$3,$4,$5,$6,$7,$7,$7,$7,null,$8,'owner','owner-csv-import',
-                'Imported from owner CSV','approved',$9,$3,now(),now())`,
-            [
-              submissionId,
-              questionId,
-              item.stableId,
-              OWNER_IMPORT_PACK_ID,
-              item.category,
-              item.tags,
-              item.statement,
-              req.user.sub,
-              item.contentHash,
-            ]
-          );
-        }
-        return { evaluation, imported: evaluation.validRows.length };
-      });
-
-      if (!committed.evaluation.ok) {
-        return res.status(409).json({
-          ...publicImportResult(committed.evaluation),
-          dryRun: false,
-          imported: 0,
-          error: "Import changed or contains rejected rows. Run dry-run again.",
-        });
-      }
-
-      const result = publicImportResult(committed.evaluation);
-      result.results = result.results.map((item) => item.status === "valid"
-        ? { ...item, status: "imported", message: "Imported and published." }
-        : item);
-      return res.json({ ...result, dryRun: false, imported: committed.imported });
-    } catch (err) {
-      console.error("[admin/questions/import]", err);
-      return res.status(500).json({ error: "Import failed; no questions were committed." });
-    }
-  }
+  (req, res) => handleOwnerQuestionImport(req, res)
 );
+
+export async function handleOwnerQuestionImport(
+  req,
+  res,
+  { queryFn = query, withTransactionFn = withTransaction } = {}
+) {
+  try {
+    const csvText = typeof req.body === "string" ? req.body : "";
+    const dryRun = req.query.dry_run !== "false";
+
+    if (dryRun) {
+      const { rows } = await queryFn(
+        `select stable_id, content_hash, truth_statement_text
+         from study_question`
+      );
+      const evaluation = evaluateOwnerQuestionCSV(csvText, rows);
+      return res.json({ ...publicImportResult(evaluation), dryRun: true, imported: 0 });
+    }
+
+    const committed = await withTransactionFn(async (client) => {
+      await client.query("LOCK TABLE study_question IN SHARE ROW EXCLUSIVE MODE");
+      const { rows } = await client.query(
+        `select stable_id, content_hash, truth_statement_text
+         from study_question`
+      );
+      const evaluation = evaluateOwnerQuestionCSV(csvText, rows);
+      if (!evaluation.ok) return { evaluation, imported: 0 };
+
+      for (const item of evaluation.validRows) {
+        const questionId = crypto.randomUUID();
+        const submissionId = crypto.randomUUID();
+        await client.query(
+          `insert into study_question
+             (id, stable_id, content_pack_id, topic, tags, prompt_text, answer_text,
+              truth_statement_text, cloze_variants_json, source_origin, status,
+              created_by_user_id, canonical_stable_id, moderation_status, content_hash,
+              is_local_only, is_community_question, submitted_to_community_at, created_at, updated_at)
+           values
+             ($1,$2,$3,$4,$5,$6,$6,$6,null,'owner-csv-import','published',
+              $7,$2,'published',$8,false,true,now(),now(),now())`,
+          [
+            questionId,
+            item.stableId,
+            OWNER_IMPORT_PACK_ID,
+            item.category,
+            item.tags,
+            item.statement,
+            req.user.sub,
+            item.contentHash,
+          ]
+        );
+        await client.query(
+          `insert into study_submission
+             (id, question_id, stable_id, content_pack_id, topic, tags, prompt_text,
+              answer_text, truth_statement_text, authored_text, cloze_variants_json,
+              submitter_id, submitter_alias, reason, note, status, content_hash,
+              canonical_stable_id, created_at, updated_at)
+           values
+             ($1,$2,$3,$4,$5,$6,$7,$7,$7,$7,null,$8,'owner','owner-csv-import',
+              'Imported from owner CSV','approved',$9,$3,now(),now())`,
+          [
+            submissionId,
+            questionId,
+            item.stableId,
+            OWNER_IMPORT_PACK_ID,
+            item.category,
+            item.tags,
+            item.statement,
+            req.user.sub,
+            item.contentHash,
+          ]
+        );
+      }
+      return { evaluation, imported: evaluation.validRows.length };
+    });
+
+    if (!committed.evaluation.ok) {
+      return res.status(409).json({
+        ...publicImportResult(committed.evaluation),
+        dryRun: false,
+        imported: 0,
+        error: "Import changed or contains rejected rows. Run dry-run again.",
+      });
+    }
+
+    const result = publicImportResult(committed.evaluation);
+    result.results = result.results.map((item) => item.status === "valid"
+      ? { ...item, status: "imported", message: "Imported and published." }
+      : item);
+    return res.json({ ...result, dryRun: false, imported: committed.imported });
+  } catch (err) {
+    console.error("[admin/questions/import]", err);
+    return res.status(500).json({ error: "Import failed; no questions were committed." });
+  }
+}
 
 function publicImportResult(evaluation) {
   const { validRows: _validRows, ...result } = evaluation;
