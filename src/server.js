@@ -125,6 +125,16 @@ async function runMigrations() {
   await query("CREATE INDEX IF NOT EXISTS idx_app_event_question_id ON app_event((coalesce(properties->>'question_id', properties->>'canonicalQuestionID')))");
   await query("CREATE INDEX IF NOT EXISTS idx_app_event_view_context ON app_event((properties->>'view_context'))");
   await query("CREATE UNIQUE INDEX IF NOT EXISTS idx_app_event_dedupe_key ON app_event(event_dedupe_key) WHERE event_dedupe_key IS NOT NULL");
+  await query(`CREATE TABLE IF NOT EXISTS app_feedback (
+    id uuid PRIMARY KEY,
+    category text NOT NULL,
+    body text NOT NULL,
+    question_id text,
+    app_details jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await query("CREATE INDEX IF NOT EXISTS idx_app_feedback_created ON app_feedback(created_at)");
+  await query("CREATE INDEX IF NOT EXISTS idx_app_feedback_question ON app_feedback(question_id)");
   console.log("Migrations complete.");
 }
 

@@ -8,6 +8,7 @@ export const config = {
   jwtSecret: process.env.JWT_SECRET,
   appleAudiences: parseAppleAudiences(process.env.APPLE_AUDIENCE),
   tempAdminBootstrapToken: process.env.TEMP_ADMIN_BOOTSTRAP_TOKEN,
+  feedbackNotificationWebhookUrl: process.env.FEEDBACK_NOTIFICATION_WEBHOOK_URL,
 };
 
 if (!config.databaseUrl) {

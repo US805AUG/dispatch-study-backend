@@ -107,6 +107,18 @@ create index if not exists idx_app_event_question_id on app_event((coalesce(prop
 create index if not exists idx_app_event_view_context on app_event((properties->>'view_context'));
 create unique index if not exists idx_app_event_dedupe_key on app_event(event_dedupe_key) where event_dedupe_key is not null;
 
+create table if not exists app_feedback (
+  id uuid primary key,
+  category text not null,
+  body text not null,
+  question_id text,
+  app_details jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_app_feedback_created on app_feedback(created_at);
+create index if not exists idx_app_feedback_question on app_feedback(question_id);
+
 -- Migration: run once in Railway SQL editor if the table already exists
 -- alter table study_question add column if not exists source_origin text default '';
 -- alter table study_submission drop constraint if exists study_submission_question_id_fkey;

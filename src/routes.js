@@ -225,11 +225,51 @@ function analyticsDedupeKey({ installId, name, timestamp, properties }) {
     .digest("hex");
 }
 
+export function feedbackNotificationPayload(feedback) {
+  return {
+    event: "feedback_received",
+    feedback: {
+      id: feedback.id,
+      category: feedback.category,
+      createdAt: feedback.createdAt,
+      appVersion: feedback.appVersion || null,
+      buildNumber: feedback.buildNumber || null,
+      platform: feedback.platform || null,
+      questionId: feedback.questionId || null,
+    },
+  };
+}
+
+export async function notifyFeedbackOwner(feedback, {
+  webhookUrl = config.feedbackNotificationWebhookUrl,
+  fetchImpl = fetch,
+} = {}) {
+  if (!webhookUrl) return { configured: false, delivered: false };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetchImpl(webhookUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(feedbackNotificationPayload(feedback)),
+      signal: controller.signal,
+    });
+    return { configured: true, delivered: response.ok };
+  } catch (error) {
+    console.error("[feedback] notification delivery failed", error?.name || "unknown_error");
+    return { configured: true, delivered: false };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export const analyticsTestHooks = {
   analyticsDedupeKey,
   analyticsScope,
   requestedAnalyticsSegment,
   withScopedAppEvent,
+  feedbackNotificationPayload,
+  notifyFeedbackOwner,
 };
 
 function commaListEnv(name) {
@@ -537,6 +577,78 @@ router.post("/analytics/events", async (req, res) => {
   } catch (error) {
     console.error("[analytics/events] insert failed", error);
     res.status(500).json({ error: "Unable to record event." });
+  }
+});
+
+router.post("/feedback", async (req, res) => {
+  try {
+    const allowedCategories = new Set(["Bug", "Question", "Suggestion", "Other"]);
+    const category = optionalShortText(req.body?.category, 24);
+    const body = typeof req.body?.body === "string" ? req.body.body.trim() : "";
+    if (!category || !allowedCategories.has(category) || !body || body.length > 4000) {
+      return res.status(400).json({ error: "A valid category and feedback message are required." });
+    }
+    const questionId = optionalShortText(req.body?.questionId, 160);
+    const includeAppDetails = req.body?.includeAppDetails === true;
+    const appDetails = includeAppDetails ? {
+      appVersion: optionalShortText(req.body?.appVersion, 32),
+      buildNumber: optionalShortText(req.body?.buildNumber, 32),
+      platform: optionalShortText(req.body?.platform, 32),
+      deviceFamily: optionalShortText(req.body?.deviceFamily, 64),
+      osVersion: optionalShortText(req.body?.osVersion, 32),
+    } : {};
+    const feedbackId = crypto.randomUUID();
+    await query(
+      `INSERT INTO app_feedback (id, category, body, question_id, app_details)
+       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+      [feedbackId, category, body, questionId, JSON.stringify(appDetails)]
+    );
+    void notifyFeedbackOwner({
+      id: feedbackId,
+      category,
+      createdAt: new Date().toISOString(),
+      questionId,
+      ...appDetails,
+    });
+    res.status(202).json({ ok: true, id: feedbackId });
+  } catch (error) {
+    console.error("[feedback] insert failed", error);
+    res.status(500).json({ error: "Unable to send feedback." });
+  }
+});
+
+router.get("/admin/feedback", requireAuth, requireRole("owner", "admin"), async (req, res) => {
+  try {
+    const requestedLimit = Number.parseInt(req.query?.limit, 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 25;
+    const before = req.query?.before ? new Date(req.query.before) : null;
+    if (before && Number.isNaN(before.getTime())) return res.status(400).json({ error: "Invalid before cursor." });
+    const result = await query(
+      `select id, category, body, question_id, app_details, created_at
+         from app_feedback
+        where ($1::timestamptz is null or created_at < $1::timestamptz)
+        order by created_at desc
+        limit $2`,
+      [before ? before.toISOString() : null, limit + 1]
+    );
+    const rows = result.rows.slice(0, limit).map((row) => {
+      const details = row.app_details && typeof row.app_details === "object" ? row.app_details : {};
+      return {
+        id: row.id,
+        category: row.category,
+        message: row.body,
+        timestamp: row.created_at,
+        appVersion: details.appVersion || null,
+        buildNumber: details.buildNumber || null,
+        platform: details.platform || null,
+        questionId: row.question_id || null,
+      };
+    });
+    res.set("Cache-Control", "no-store");
+    res.json({ feedback: rows, hasMore: result.rows.length > limit, nextBefore: rows.length ? rows.at(-1).timestamp : null });
+  } catch (error) {
+    console.error("[admin/feedback] list failed", error?.name || "unknown_error");
+    res.status(500).json({ error: "Unable to load feedback." });
   }
 });
 
