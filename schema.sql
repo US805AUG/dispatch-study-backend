@@ -125,6 +125,7 @@ create table if not exists feedback_v1_response (
   install_id text not null,
   feedback_version integer not null check (feedback_version = 1),
   journey_stage text not null,
+  school_code text,
   school text,
   job_to_be_done text not null,
   current_value text not null,

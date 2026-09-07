@@ -11,6 +11,24 @@ const JOURNEY_STAGES = new Set([
   "just_exploring",
 ]);
 
+const SCHOOL_CODES = new Set([
+  "aircraft_dispatch_academy",
+  "ifod",
+  "flight_dispatch_network",
+  "flamingo_air_academy",
+  "jeppesen_dispatch_academy",
+  "other",
+]);
+
+const SCHOOL_TITLES = new Map([
+  ["aircraft_dispatch_academy", "Aircraft Dispatch Academy (ADA)"],
+  ["ifod", "Institute of Flight Operations and Dispatch (IFOD)"],
+  ["flight_dispatch_network", "Flight Dispatch Network (FDN)"],
+  ["flamingo_air_academy", "Flamingo Air Academy"],
+  ["jeppesen_dispatch_academy", "Jeppesen Dispatch Academy"],
+  ["other", "Other"],
+]);
+
 const JOBS_TO_BE_DONE = new Set([
   "pass_adx",
   "keep_up_with_school",
@@ -87,7 +105,9 @@ export function validateFeedbackV1Response(body) {
   const discovery = enumValue(body.discoverySource, DISCOVERY_SOURCES, false);
   const purchase = enumValue(body.purchaseAnswer, PURCHASE_ANSWERS, false);
   const subscriber = enumValue(body.subscriberState, SUBSCRIBER_STATES, true);
-  const school = optionalText(body.school, 200);
+  const legacySchool = optionalText(body.school, 200);
+  const schoolCode = enumValue(body.schoolCode, SCHOOL_CODES, false);
+  const schoolName = optionalText(body.schoolName, 200);
   const retention = optionalText(body.retentionText, 1000);
 
   if (body.feedbackVersion !== FEEDBACK_V1_VERSION) {
@@ -99,8 +119,18 @@ export function validateFeedbackV1Response(body) {
   if (!journey.ok || !job.ok || !currentValue.ok || !discovery.ok || !purchase.ok || !subscriber.ok) {
     return { ok: false, error: "One or more feedback answers are invalid." };
   }
-  if (!school.ok || !retention.ok) {
+  if (!legacySchool.ok || !schoolName.ok || !retention.ok) {
     return { ok: false, error: "A feedback text field is too long or invalid." };
+  }
+  if (!schoolCode.ok) {
+    return { ok: false, error: "The selected school is invalid." };
+  }
+  const normalizedSchoolCode = schoolCode.value ?? (legacySchool.value ? "other" : null);
+  const normalizedSchoolName = schoolName.value ?? legacySchool.value;
+  const schoolJourney = journey.value === "starting_school_soon" || journey.value === "currently_in_school";
+  if ((!schoolJourney && (normalizedSchoolCode || normalizedSchoolName))
+      || (normalizedSchoolName && normalizedSchoolCode !== "other")) {
+    return { ok: false, error: "The school response is inconsistent with the selected journey." };
   }
   if (subscriber.value === "subscriber" && purchase.value != null) {
     return { ok: false, error: "Purchase feedback is not accepted for active subscribers." };
@@ -112,7 +142,8 @@ export function validateFeedbackV1Response(body) {
       promptInstanceId,
       installId,
       journeyStage: journey.value,
-      school: school.value,
+      schoolCode: normalizedSchoolCode,
+      schoolName: normalizedSchoolName,
       jobToBeDone: job.value,
       currentValue: currentValue.value,
       retentionText: retention.value,
@@ -134,10 +165,10 @@ export async function handleFeedbackV1Submission(req, res, { queryFn = query } =
     const responseId = crypto.randomUUID();
     const inserted = await queryFn(
       `INSERT INTO feedback_v1_response
-        (id, prompt_instance_id, install_id, feedback_version, journey_stage, school,
+        (id, prompt_instance_id, install_id, feedback_version, journey_stage, school_code, school,
          job_to_be_done, current_value, retention_text, discovery_source, purchase_answer,
          subscriber_state, app_version, build_number, platform)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        ON CONFLICT (prompt_instance_id) DO NOTHING
        RETURNING id`,
       [
@@ -146,7 +177,8 @@ export async function handleFeedbackV1Submission(req, res, { queryFn = query } =
         value.installId,
         FEEDBACK_V1_VERSION,
         value.journeyStage,
-        value.school,
+        value.schoolCode,
+        value.schoolName,
         value.jobToBeDone,
         value.currentValue,
         value.retentionText,
@@ -239,7 +271,7 @@ export async function handleOwnerFeedbackV1List(req, res, { queryFn = query } = 
   if (before && Number.isNaN(before.getTime())) return res.status(400).json({ error: "Invalid before cursor." });
   try {
     const result = await queryFn(
-      `SELECT r.id, r.prompt_instance_id, r.submitted_at, r.journey_stage, r.school,
+      `SELECT r.id, r.prompt_instance_id, r.submitted_at, r.journey_stage, r.school_code, r.school,
               r.job_to_be_done, r.current_value, r.retention_text, r.discovery_source,
               r.purchase_answer, r.subscriber_state, r.app_version, r.build_number,
               r.platform, r.tester_interest_at, c.email, c.created_at AS contact_created_at
@@ -255,7 +287,9 @@ export async function handleOwnerFeedbackV1List(req, res, { queryFn = query } = 
       promptInstanceId: row.prompt_instance_id,
       timestamp: row.submitted_at,
       journeyStage: row.journey_stage,
-      school: row.school,
+      school: feedbackV1SchoolDisplay(row.school_code, row.school),
+      schoolCode: row.school_code,
+      schoolName: row.school,
       jobToBeDone: row.job_to_be_done,
       currentValue: row.current_value,
       retentionText: row.retention_text,
@@ -278,4 +312,10 @@ export async function handleOwnerFeedbackV1List(req, res, { queryFn = query } = 
     console.error("[admin/feedback-v1] list failed", error?.name || "unknown_error");
     return res.status(500).json({ error: "Unable to load feedback interviews." });
   }
+}
+
+function feedbackV1SchoolDisplay(schoolCode, schoolName) {
+  if (!schoolCode) return schoolName ?? null;
+  const title = SCHOOL_TITLES.get(schoolCode) ?? schoolCode;
+  return schoolCode === "other" && schoolName ? `${title} — ${schoolName}` : title;
 }

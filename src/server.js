@@ -141,6 +141,7 @@ async function runMigrations() {
     install_id text NOT NULL,
     feedback_version integer NOT NULL CHECK (feedback_version = 1),
     journey_stage text NOT NULL,
+    school_code text,
     school text,
     job_to_be_done text NOT NULL,
     current_value text NOT NULL,
@@ -154,6 +155,7 @@ async function runMigrations() {
     tester_interest_at timestamptz,
     submitted_at timestamptz NOT NULL DEFAULT now()
   )`);
+  await query("ALTER TABLE feedback_v1_response ADD COLUMN IF NOT EXISTS school_code text");
   await query("CREATE INDEX IF NOT EXISTS idx_feedback_v1_response_submitted ON feedback_v1_response(submitted_at DESC)");
   await query("CREATE INDEX IF NOT EXISTS idx_feedback_v1_response_install ON feedback_v1_response(install_id)");
   await query(`CREATE TABLE IF NOT EXISTS feedback_v1_contact (

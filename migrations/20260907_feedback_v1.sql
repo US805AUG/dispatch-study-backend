@@ -6,6 +6,7 @@ create table if not exists feedback_v1_response (
   install_id text not null,
   feedback_version integer not null check (feedback_version = 1),
   journey_stage text not null,
+  school_code text,
   school text,
   job_to_be_done text not null,
   current_value text not null,
@@ -19,6 +20,9 @@ create table if not exists feedback_v1_response (
   tester_interest_at timestamptz,
   submitted_at timestamptz not null default now()
 );
+
+alter table feedback_v1_response
+  add column if not exists school_code text;
 
 create index if not exists idx_feedback_v1_response_submitted
   on feedback_v1_response(submitted_at desc);
