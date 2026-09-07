@@ -14,6 +14,12 @@ import {
   evaluateOwnerQuestionCSV,
   OWNER_IMPORT_PACK_ID,
 } from "./ownerQuestionImport.js";
+import {
+  handleFeedbackV1Contact,
+  handleFeedbackV1Submission,
+  handleFeedbackV1TesterInterest,
+  handleOwnerFeedbackV1List,
+} from "./feedbackV1.js";
 
 export const router = express.Router();
 
@@ -617,6 +623,10 @@ router.post("/feedback", async (req, res) => {
   }
 });
 
+router.post("/feedback/v1/responses", handleFeedbackV1Submission);
+router.post("/feedback/v1/tester-interest", handleFeedbackV1TesterInterest);
+router.post("/feedback/v1/contact", handleFeedbackV1Contact);
+
 router.get("/admin/feedback", requireAuth, requireRole("owner", "admin"), async (req, res) => {
   try {
     const requestedLimit = Number.parseInt(req.query?.limit, 10);
@@ -651,6 +661,13 @@ router.get("/admin/feedback", requireAuth, requireRole("owner", "admin"), async 
     res.status(500).json({ error: "Unable to load feedback." });
   }
 });
+
+router.get(
+  "/admin/feedback-v1",
+  requireAuth,
+  requireRole("owner", "admin"),
+  handleOwnerFeedbackV1List
+);
 
 router.get("/analytics/geo-diagnostics", (req, res) => {
   res.set("Cache-Control", "no-store");

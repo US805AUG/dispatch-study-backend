@@ -37,6 +37,8 @@ npm run dev
 
 The owner/admin-only `GET /api/admin/feedback?limit=25&before=<ISO-8601>` endpoint powers the Feedback Inbox in `Sadiom-Work/admin/flight-dispatch-analytics.html`. It requires a normal backend JWT and returns newest-first safe fields. If the webhook is unset or unavailable, feedback is still saved and remains visible in the inbox.
 
+Feedback Intelligence V1 uses dedicated anonymous endpoints under `/api/feedback/v1` and stores interview responses separately from `app_event` and ordinary `app_feedback`. `promptInstanceId` is the idempotency key. Tester email is accepted only after a completed response and explicit tester interest, and is stored in `feedback_v1_contact`, never in analytics events. Owner/admin users can inspect interviews with `GET /api/admin/feedback-v1?limit=50&before=<ISO-8601>`.
+
 ## Schema
 
 Apply `schema.sql` to your Postgres database.

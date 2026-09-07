@@ -135,6 +135,34 @@ async function runMigrations() {
   )`);
   await query("CREATE INDEX IF NOT EXISTS idx_app_feedback_created ON app_feedback(created_at)");
   await query("CREATE INDEX IF NOT EXISTS idx_app_feedback_question ON app_feedback(question_id)");
+  await query(`CREATE TABLE IF NOT EXISTS feedback_v1_response (
+    id uuid PRIMARY KEY,
+    prompt_instance_id uuid UNIQUE NOT NULL,
+    install_id text NOT NULL,
+    feedback_version integer NOT NULL CHECK (feedback_version = 1),
+    journey_stage text NOT NULL,
+    school text,
+    job_to_be_done text NOT NULL,
+    current_value text NOT NULL,
+    retention_text text,
+    discovery_source text,
+    purchase_answer text,
+    subscriber_state text NOT NULL,
+    app_version text,
+    build_number text,
+    platform text,
+    tester_interest_at timestamptz,
+    submitted_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await query("CREATE INDEX IF NOT EXISTS idx_feedback_v1_response_submitted ON feedback_v1_response(submitted_at DESC)");
+  await query("CREATE INDEX IF NOT EXISTS idx_feedback_v1_response_install ON feedback_v1_response(install_id)");
+  await query(`CREATE TABLE IF NOT EXISTS feedback_v1_contact (
+    id uuid PRIMARY KEY,
+    response_id uuid UNIQUE NOT NULL REFERENCES feedback_v1_response(id) ON DELETE CASCADE,
+    email text NOT NULL,
+    consent_version text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
   console.log("Migrations complete.");
 }
 
